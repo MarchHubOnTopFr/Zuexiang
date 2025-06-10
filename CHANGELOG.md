@@ -1,6 +1,6 @@
 # Changelog
 
-## [v1.1] - 2025-06-08
+## [v1.1] - 2025-06-11
 
 ### Added
 - Type annotation, type assertion, and type definition parsing

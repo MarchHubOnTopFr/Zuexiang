@@ -4,7 +4,7 @@
 
   Original base project:
     Yueliang - Lua 5.1 Bytecode Compiler
-    Author: Kein-Hong man
+    Author: Kein-Hong Man
     Source: http://yueliang.luaforge.net/
 
   Modifications and extensions by:
@@ -12,11 +12,14 @@
 
   This version includes:
     - Support for 'goto' and 'continue'
-    - Compound assignment (+=, -=, etc.)
+    - Compound assignment (+=, -=, etc.) with proper table/index handling
     - '!=' alias for '~='
-    - Luau-style number literals
+    - Luau-style number literals (binary, octal, hex, 1_000, 1e3, etc.)
     - Ternary expressions in local declarations
     - Integer division operator (//)
+    - Type annotation, type assertion, and type definitions (parser-only)
+    - Parsing support for <const> and <close> variable qualifiers
+    - Renamed local names for better readability
     - Parser and performance improvements
 
   License:
@@ -27,17 +30,10 @@
     for experimentation, learning, and fun. Expect messy code and fast hacks.
 ]]
 
-local luaZ, luaY, luaK, luaU, luaK = {}, {}, {}, {}, {}
-function luaZ:init(reader, data)
-    if not reader then
-        return
-    end
-    data = data or ""
-    return {reader = reader, data = data, name = "", n = #data, p = 0}
-end
-function luaZ:make_getF(source)
+local Buffer, Parser, Lexer, Serializer, Codegen = {}, {}, {}, {}, {}
+function Buffer:init(source)
     local pos, buffer = 1, ""
-    return function()
+    return {reader = function()
         if pos > #source and #buffer == 0 then
             return nil
         end
@@ -48,14 +44,14 @@ function luaZ:make_getF(source)
         local c = buffer:sub(1, 1)
         buffer = buffer:sub(2)
         return c
-    end
+    end, data = "", name = "", n = 0, p = 0}
 end
-function luaZ:fill(z)
+function Buffer:fill(z)
     z.data = z.reader() or ""
     z.n, z.p = #z.data - 1, 1
     return z.n >= 0 and z.data:sub(1, 1) or "EOZ"
 end
-luaK.RESERVED =
+Lexer.RESERVED =
     [[
     TK_AND and
     TK_BREAK break
@@ -102,17 +98,17 @@ luaK.RESERVED =
     TK_STRING <string>
     TK_EOS <eof>
 ]]
-luaK.MAXSRC = 80
-luaK.MAX_INT = 2147483645
-luaK.LUA_COMPAT_LSTR = 1
-function luaK:init()
+Lexer.MAXSRC = 80
+Lexer.MAX_INT = 2147483645
+Lexer.LUA_COMPAT_LSTR = 1
+function Lexer:init()
     local tokens, enums = {}, {}
     for tok, str in self.RESERVED:gmatch("(%S+)%s+(%S+)") do
         tokens[tok], enums[str] = str, tok
     end
     self.tokens, self.enums = tokens, enums
 end
-function luaK:chunkid(source, bufflen)
+function Lexer:chunkid(source, bufflen)
     local first, len = source:sub(1, 1), bufflen - 3
     if first == "=" then
         return source:sub(2, len + 1)
@@ -122,13 +118,13 @@ function luaK:chunkid(source, bufflen)
     source = #source > len and "..." .. source:sub(-len) or ('[string "%s"]'):format(source)
     return source
 end
-function luaK:token2str(token)
+function Lexer:token2str(token)
     local t = self.tokens[token]
     return t or type(token) == string and (token:match("%c") and ("char(%d)"):format(token:byte())) or token
 end
-function luaK:lexerror(ls, msg, token)
+function Lexer:lexerror(ls, msg, token)
     local txtToken =
-        token == "TK_NAME" or token == "TK_STRING" or token == "TK_NUMBER" and ls.buff or self:token2str(token)
+        (token == "TK_NAME" or token == "TK_STRING" or token == "TK_NUMBER") and ls.buff or self:token2str(token) or "<unknown>"
     local line, context = ls.linenumber, ls.buff or ls.current or "<unknown>"
     error(
         ("%s:%d: %s (near '%s')%s"):format(
@@ -136,17 +132,17 @@ function luaK:lexerror(ls, msg, token)
             line,
             msg,
             context,
-            token and ", token: " .. txtToken or ""
+            token and ", token: " .. txtToken
         )
     )
 end
-function luaK:syntaxerror(ls, msg)
+function Lexer:syntaxerror(ls, msg)
     self:lexerror(ls, msg, ls.t.token)
 end
-function luaK:currIsNewline(ls)
+function Lexer:currIsNewline(ls)
     return ls.current == "\n" or ls.current == "\r"
 end
-function luaK:inclinenumber(ls)
+function Lexer:inclinenumber(ls)
     local old = ls.current
     self:nextc(ls)
     if self:currIsNewline(ls) and ls.current ~= old then
@@ -157,7 +153,7 @@ function luaK:inclinenumber(ls)
         self:syntaxerror(ls, "chunk has too many lines")
     end
 end
-function luaK:setinput(L, ls, z, source)
+function Lexer:setinput(L, ls, z, source)
     ls = ls or {}
     ls.lookahead, ls.t = ls.lookahead or {}, ls.t or {}
     ls.decpoint, ls.L = ".", L
@@ -167,14 +163,14 @@ function luaK:setinput(L, ls, z, source)
     ls.source = source
     self:nextc(ls)
 end
-function luaK:check_next(ls, set)
+function Lexer:check_next(ls, set)
     if not set:find(ls.current, 1, true) then
         return false
     end
     self:save_and_next(ls)
     return true
 end
-function luaK:next(ls)
+function Lexer:next(ls)
     ls.lastline = ls.linenumber
     if ls.lookahead.token ~= "TK_EOS" then
         ls.t.token, ls.t.seminfo = ls.lookahead.token, ls.lookahead.seminfo
@@ -183,10 +179,10 @@ function luaK:next(ls)
         ls.t.token = self:llex(ls, ls.t)
     end
 end
-function luaK:lookahead(ls)
+function Lexer:lookahead(ls)
     ls.lookahead.token = self:llex(ls, ls.lookahead)
 end
-function luaK:nextc(ls)
+function Lexer:nextc(ls)
     local z = ls.z
     z.p = z.p + 1
     z.n = z.n - 1
@@ -199,10 +195,10 @@ function luaK:nextc(ls)
     end
     return ls.current
 end
-function luaK:save(ls, c)
+function Lexer:save(ls, c)
     ls.buff = (ls.buff or "") .. c
 end
-function luaK:save_and_next(ls)
+function Lexer:save_and_next(ls)
     ls.buff = (ls.buff or "") .. ls.current
     local z = ls.z
     z.p = z.p + 1
@@ -216,7 +212,7 @@ function luaK:save_and_next(ls)
     end
     return ls.current
 end
-function luaK:buffreplace(ls, from, to)
+function Lexer:buffreplace(ls, from, to)
     local result, buff = "", ls.buff
     for p = 1, #buff do
         local c = string.sub(buff, p, p)
@@ -227,7 +223,7 @@ function luaK:buffreplace(ls, from, to)
     end
     ls.buff = result
 end
-function luaK:trydecpoint(ls, Token)
+function Lexer:trydecpoint(ls, Token)
     local old = ls.decpoint
     self:buffreplace(ls, old, ".")
     self:buffreplace(ls, "_", "")
@@ -238,7 +234,7 @@ function luaK:trydecpoint(ls, Token)
     end
     Token.seminfo = num
 end
-function luaK:read_numeral(ls, Token)
+function Lexer:read_numeral(ls, Token)
     local buffer = {}
     local is_hex, is_bin, is_oct = false, false, false
     local neg = false
@@ -329,7 +325,7 @@ function luaK:read_numeral(ls, Token)
     end
     Token.seminfo = neg and -num or num
 end
-function luaK:read_long_string(ls, Token, sep)
+function Lexer:read_long_string(ls, Token, sep)
     local cont = 0
     self:save_and_next(ls)
     if self:currIsNewline(ls) then
@@ -376,7 +372,7 @@ function luaK:read_long_string(ls, Token, sep)
         Token.seminfo = ls.buff:sub(3 + sep, -(3 + sep))
     end
 end
-function luaK:read_string(ls, del, Token)
+function Lexer:read_string(ls, del, Token)
     self:save_and_next(ls)
     while ls.current ~= del do
         local c = ls.current
@@ -413,7 +409,7 @@ function luaK:read_string(ls, del, Token)
     self:save_and_next(ls)
     Token.seminfo = ls.buff:sub(2, -2)
 end
-function luaK:skip_sep(ls)
+function Lexer:skip_sep(ls)
     local count = 0
     local s = ls.current
     self:save_and_next(ls)
@@ -423,7 +419,7 @@ function luaK:skip_sep(ls)
     end
     return (ls.current == s) and count or (-count) - 1
 end
-function luaK:llex(ls, Token)
+function Lexer:llex(ls, Token)
     ls.buff = ""
     while true do
         local c = ls.current
@@ -582,17 +578,17 @@ function luaK:llex(ls, Token)
             elseif string.find(c, "%d") then
                 self:read_numeral(ls, Token)
                 return "TK_NUMBER"
-            elseif string.find(c, "[_%a]") then
-                repeat
-                    c = self:save_and_next(ls)
-                until c == "EOZ" or not string.find(c, "[_%w]")
-                local ts = ls.buff
-                local tok = self.enums[ts]
-                if tok then
-                    return tok
-                end
-                Token.seminfo = ts
-                return "TK_NAME"
+elseif string.find(c, "[_%a]") then
+    repeat
+        c = self:save_and_next(ls)
+    until c == "EOZ" or not string.find(c, "[_%w]")
+    local ts = ls.buff
+    local tok = self.enums[ts]
+    if tok then
+        return tok
+    end
+    Token.seminfo = ts
+    return "TK_NAME"
             else
                 self:nextc(ls)
                 return c
@@ -616,7 +612,7 @@ local MAXARG_sBx = 131071
 local BITRK = 256
 local MAXINDEXRK = 255
 local NO_REG = 255
-local luaP = {
+local Instruction = {
     OpMode = {iABC = 0, iABx = 1, iAsBx = 2},
     SIZE_OP = SIZE_OP,
     SIZE_A = SIZE_A,
@@ -681,18 +677,18 @@ local opnames = {
     "CLOSURE",
     "VARARG"
 }
-local OpCode, ROpCode, opname = luaP.OpCode, luaP.ROpCode, luaP.opnames
+local OpCode, ROpCode, opname = Instruction.OpCode, Instruction.ROpCode, Instruction.opnames
 for i = 0, #opnames - 1 do
     local name = "OP_" .. opnames[i + 1]
     opname[i] = opnames[i + 1]
     OpCode[name], ROpCode[i] = i, name
 end
-luaP.NUM_OPCODES = #opnames
-luaP.OpArgMask = {OpArgN = 0, OpArgU = 1, OpArgR = 2, OpArgK = 3}
+Instruction.NUM_OPCODES = #opnames
+Instruction.OpArgMask = {OpArgN = 0, OpArgU = 1, OpArgR = 2, OpArgK = 3}
 local function opmode(t, a, b, c, m)
-    return t * 128 + a * 64 + luaP.OpArgMask[b] * 16 + luaP.OpArgMask[c] * 4 + luaP.OpMode[m]
+    return t * 128 + a * 64 + Instruction.OpArgMask[b] * 16 + Instruction.OpArgMask[c] * 4 + Instruction.OpMode[m]
 end
-luaP.opmodes = {
+Instruction.opmodes = {
     opmode(0, 1, "OpArgK", "OpArgN", "iABx"),
     opmode(0, 1, "OpArgU", "OpArgU", "iABC"),
     opmode(0, 1, "OpArgR", "OpArgN", "iABC"),
@@ -731,61 +727,65 @@ luaP.opmodes = {
     opmode(0, 1, "OpArgU", "OpArgN", "iABx"),
     opmode(0, 1, "OpArgU", "OpArgN", "iABC")
 }
-luaP.opmodes[0] = opmode(0, 1, "OpArgR", "OpArgN", "iABC")
-function luaP:GET_OPCODE(i)
+Instruction.opmodes[0] = opmode(0, 1, "OpArgR", "OpArgN", "iABC")
+function Instruction:GET_OPCODE(i)
     return self.ROpCode[i.OP]
 end
-function luaP:SET_OPCODE(i, o)
+function Instruction:SET_OPCODE(i, o)
     i.OP = self.OpCode[o]
 end
-function luaP:GETARG_A(i)
+function Instruction:GETARG_A(i)
     return i.A
 end
-function luaP:SETARG_A(i, a)
+function Instruction:SETARG_A(i, a)
     i.A = a
 end
-function luaP:GETARG_B(i)
+function Instruction:GETARG_B(i)
     return i.B
 end
-function luaP:SETARG_B(i, b)
+function Instruction:SETARG_B(i, b)
     i.B = b
 end
-function luaP:GETARG_C(i)
+function Instruction:GETARG_C(i)
     return i.C
 end
-function luaP:SETARG_C(i, c)
+function Instruction:SETARG_C(i, c)
     i.C = c
 end
-function luaP:GETARG_Bx(i)
+function Instruction:GETARG_Bx(i)
     return i.Bx
 end
-function luaP:SETARG_Bx(i, bx)
+function Instruction:SETARG_Bx(i, bx)
     i.Bx = bx
 end
-function luaP:GETARG_sBx(i)
+function Instruction:GETARG_sBx(i)
     return i.Bx - self.MAXARG_sBx
 end
-function luaP:SETARG_sBx(i, sbx)
+function Instruction:SETARG_sBx(i, sbx)
     i.Bx = sbx + self.MAXARG_sBx
 end
-function luaP:CREATE_ABC(o, a, b, c)
+function Instruction:CREATE_ABC(o, a, b, c)
     return {OP = self.OpCode[o], A = a, B = b, C = c}
 end
-function luaP:CREATE_ABx(o, a, bc)
+function Instruction:CREATE_ABx(o, a, bc)
     return {OP = self.OpCode[o], A = a, Bx = bc}
 end
-function luaP:CREATE_Inst(code)
+function Instruction:CREATE_Inst(code)
     local o = code % 64
     local a = (code - o) / 64 % 256
     local bx = (code - o - a * 64) / 16384
     return self:CREATE_ABx(o, a, bx)
 end
-function luaP:Instruction(i)
+function Instruction:Instruction(i)
     if i.Bx then
         i.C = i.Bx % 512
         i.B = (i.Bx - i.C) / 512
+        assert(i.B < 512, "B argument out of range")
+        assert(i.C < 512, "C argument out of range")
     end
     local v = i.A * 64 + i.OP
+    assert(i.A < 256, "A argument out of range")
+    assert(i.OP < 64, "OP argument out of range")
     local c0 = v % 256
     v = (v - c0) / 256 + i.C * 64
     local c1 = v % 256
@@ -794,7 +794,7 @@ function luaP:Instruction(i)
     local c3 = (v - c2) / 256
     return string.char(c0, c1, c2, c3)
 end
-function luaP:DecodeInst(x)
+function Instruction:DecodeInst(x)
     local byte = string.byte
     local b1, b2, b3, b4 = byte(x, 1, 4)
     local op = b1 % 64
@@ -807,41 +807,41 @@ function luaP:DecodeInst(x)
     end
     return i
 end
-function luaP:ISK(x)
+function Instruction:ISK(x)
     return x >= self.BITRK
 end
-function luaP:INDEXK(r)
+function Instruction:INDEXK(r)
     return r - self.BITRK
 end
-function luaP:RKASK(x)
+function Instruction:RKASK(x)
     return x + self.BITRK
 end
-function luaP:getOpMode(m)
+function Instruction:getOpMode(m)
     return self.opmodes[self.OpCode[m]] % 4
 end
-function luaP:getBMode(m)
+function Instruction:getBMode(m)
     return math.floor(self.opmodes[self.OpCode[m]] / 16) % 4
 end
-function luaP:getCMode(m)
+function Instruction:getCMode(m)
     return math.floor(self.opmodes[self.OpCode[m]] / 4) % 4
 end
-function luaP:testAMode(m)
+function Instruction:testAMode(m)
     return math.floor(self.opmodes[self.OpCode[m]] / 64) % 2
 end
-function luaP:testTMode(m)
+function Instruction:testTMode(m)
     return math.floor(self.opmodes[self.OpCode[m]] / 128)
 end
-luaP.LFIELDS_PER_FLUSH = 50
-luaU.LUA_SIGNATURE = "\27Lua"
-luaU.LUA_TNUMBER = 3
-luaU.LUA_TSTRING = 4
-luaU.LUA_TNIL = 0
-luaU.LUA_TBOOLEAN = 1
-luaU.LUA_TNONE = -1
-luaU.LUAC_VERSION = 81
-luaU.LUAC_FORMAT = 0
-luaU.LUAC_HEADERSIZE = 12
-function luaU:make_setS()
+Instruction.LFIELDS_PER_FLUSH = 50
+Serializer.LUA_SIGNATURE = "\27Lua"
+Serializer.LUA_TNUMBER = 3
+Serializer.LUA_TSTRING = 4
+Serializer.LUA_TNIL = 0
+Serializer.LUA_TBOOLEAN = 1
+Serializer.LUA_TNONE = -1
+Serializer.LUAC_VERSION = 81
+Serializer.LUAC_FORMAT = 0
+Serializer.LUAC_HEADERSIZE = 12
+function Serializer:make_setS()
     local buff = {chunks = {}}
     local writer = function(s, buff)
         if not s then
@@ -853,7 +853,7 @@ function luaU:make_setS()
     end
     return writer, buff
 end
-function luaU:make_setF(filename)
+function Serializer:make_setF(filename)
     local buff = {}
     buff.h = io.open(filename, "wb")
     if not buff.h then
@@ -876,7 +876,7 @@ function luaU:make_setF(filename)
     end
     return writer, buff
 end
-function luaU:ttype(o)
+function Serializer:ttype(o)
     local tt = type(o.value)
     if tt == "number" then
         return self.LUA_TNUMBER
@@ -898,7 +898,7 @@ function frexp(x)
     local m = x / 2 ^ e
     return m, e
 end
-function luaU:from_double(x)
+function Serializer:from_double(x)
     local chunks = {}
     local function grab_byte(v)
         local c = v % 256
@@ -926,7 +926,7 @@ function luaU:from_double(x)
     v, chunks[8] = grab_byte(sign * 128 + v)
     return table.concat(chunks)
 end
-function luaU:from_int(x)
+function Serializer:from_int(x)
     local v = ""
     x = math.floor(x)
     if x < 0 then
@@ -939,25 +939,25 @@ function luaU:from_int(x)
     end
     return v
 end
-function luaU:DumpBlock(b, D)
+function Serializer:DumpBlock(b, D)
     if D.status == 0 then
         D.status = D.write(b, D.data)
     end
 end
-function luaU:DumpChar(y, D)
+function Serializer:DumpChar(y, D)
     self:DumpBlock(string.char(y), D)
 end
-function luaU:DumpInt(x, D)
+function Serializer:DumpInt(x, D)
     self:DumpBlock(self:from_int(x), D)
 end
-function luaU:DumpSizeT(x, D)
+function Serializer:DumpSizeT(x, D)
     self:DumpBlock(self:from_int(x), D)
     self:DumpBlock(self:from_int(0), D)
 end
-function luaU:DumpNumber(x, D)
+function Serializer:DumpNumber(x, D)
     self:DumpBlock(self:from_double(x), D)
 end
-function luaU:DumpString(s, D)
+function Serializer:DumpString(s, D)
     if s == nil then
         self:DumpSizeT(0, D)
     else
@@ -965,16 +965,16 @@ function luaU:DumpString(s, D)
         self:DumpBlock(s .. "\0", D)
     end
 end
-function luaU:DumpCode(f, D)
+function Serializer:DumpCode(f, D)
     local n = f.sizecode
     self:DumpInt(n, D)
     local chunks = {}
     for i = 0, n - 1 do
-        chunks[i + 1] = luaP:Instruction(f.code[i])
+        chunks[i + 1] = Instruction:Instruction(f.code[i])
     end
     self:DumpBlock(table.concat(chunks), D)
 end
-function luaU:DumpConstants(f, D)
+function Serializer:DumpConstants(f, D)
     local n = f.sizek
     self:DumpInt(n, D)
     for i = 0, n - 1 do
@@ -997,7 +997,7 @@ function luaU:DumpConstants(f, D)
         self:DumpFunction(f.p[i], f.source, D)
     end
 end
-function luaU:DumpDebug(f, D)
+function Serializer:DumpDebug(f, D)
     local n
     n = D.strip and 0 or f.sizelineinfo
     self:DumpInt(n, D)
@@ -1017,7 +1017,7 @@ function luaU:DumpDebug(f, D)
         self:DumpString(f.upvalues[i], D)
     end
 end
-function luaU:DumpFunction(f, p, D)
+function Serializer:DumpFunction(f, p, D)
     local source = f.source
     if source == p or D.strip then
         source = nil
@@ -1033,16 +1033,16 @@ function luaU:DumpFunction(f, p, D)
     self:DumpConstants(f, D)
     self:DumpDebug(f, D)
 end
-function luaU:DumpHeader(D)
+function Serializer:DumpHeader(D)
     local h = self:header()
     assert(#h == self.LUAC_HEADERSIZE)
     self:DumpBlock(h, D)
 end
-function luaU:header()
+function Serializer:header()
     local x = 1
     return self.LUA_SIGNATURE .. string.char(self.LUAC_VERSION, self.LUAC_FORMAT, x, 4, 8, 4, 8, 0)
 end
-function luaU:dump(L, f, w, data, strip)
+function Serializer:dump(L, f, w, data, strip)
     local D = {}
     D.L = L
     D.write = w
@@ -1054,48 +1054,48 @@ function luaU:dump(L, f, w, data, strip)
     D.write(nil, D.data)
     return D.status
 end
-luaK.MAXSTACK = 250
-function luaK:ttisnumber(o)
+Codegen.MAXSTACK = 250
+function Codegen:ttisnumber(o)
     return o and type(o.value) == "number" or false
 end
-function luaK:nvalue(o)
+function Codegen:nvalue(o)
     return o.value
 end
-function luaK:setnilvalue(o)
+function Codegen:setnilvalue(o)
     o.value = nil
 end
-function luaK:setsvalue(o, x)
+function Codegen:setsvalue(o, x)
     o.value = x
 end
-luaK.setnvalue = luaK.setsvalue
-luaK.sethvalue = luaK.setsvalue
-luaK.setbvalue = luaK.setsvalue
-function luaK:numadd(a, b)
+Codegen.setnvalue = Codegen.setsvalue
+Codegen.sethvalue = Codegen.setsvalue
+Codegen.setbvalue = Codegen.setsvalue
+function Codegen:numadd(a, b)
     return a + b
 end
-function luaK:numsub(a, b)
+function Codegen:numsub(a, b)
     return a - b
 end
-function luaK:nummul(a, b)
+function Codegen:nummul(a, b)
     return a * b
 end
-function luaK:numdiv(a, b)
+function Codegen:numdiv(a, b)
     return a / b
 end
-function luaK:nummod(a, b)
+function Codegen:nummod(a, b)
     return a % b
 end
-function luaK:numpow(a, b)
+function Codegen:numpow(a, b)
     return a ^ b
 end
-function luaK:numunm(a)
+function Codegen:numunm(a)
     return -a
 end
-function luaK:numisnan(a)
+function Codegen:numisnan(a)
     return a ~= a
 end
-luaK.NO_JUMP = -1
-luaK.BinOpr = {
+Codegen.NO_JUMP = -1
+Codegen.BinOpr = {
     OPR_ADD = 0,
     OPR_SUB = 1,
     OPR_MUL = 2,
@@ -1115,23 +1115,23 @@ luaK.BinOpr = {
     OPR_FLOORDIV2 = 16,
     OPR_NOBINOPR = 17
 }
-luaK.UnOpr = {OPR_MINUS = 0, OPR_NOT = 1, OPR_LEN = 2, OPR_NOUNOPR = 3}
-function luaK:getcode(fs, e)
+Codegen.UnOpr = {OPR_MINUS = 0, OPR_NOT = 1, OPR_LEN = 2, OPR_NOUNOPR = 3}
+function Codegen:getcode(fs, e)
     return fs.f.code[e.info]
 end
-function luaK:codeAsBx(fs, o, A, sBx)
-    return self:codeABx(fs, o, A, sBx + luaP.MAXARG_sBx)
+function Codegen:codeAsBx(fs, o, A, sBx)
+    return self:codeABx(fs, o, A, sBx + Instruction.MAXARG_sBx)
 end
-function luaK:setmultret(fs, e)
-    self:setreturns(fs, e, luaY.LUA_MULTRET)
+function Codegen:setmultret(fs, e)
+    self:setreturns(fs, e, Parser.LUA_MULTRET)
 end
-function luaK:hasjumps(e)
+function Codegen:hasjumps(e)
     return e.t ~= e.f
 end
-function luaK:isnumeral(e)
+function Codegen:isnumeral(e)
     return e.k == "VKNUM" and e.t == self.NO_JUMP and e.f == self.NO_JUMP
 end
-function luaK:_nil(fs, from, n)
+function Codegen:_nil(fs, from, n)
     if fs.pc > fs.lasttarget then
         if fs.pc == 0 then
             if from >= fs.nactvar then
@@ -1139,12 +1139,12 @@ function luaK:_nil(fs, from, n)
             end
         else
             local previous = fs.f.code[fs.pc - 1]
-            if luaP:GET_OPCODE(previous) == "OP_LOADNIL" then
-                local pfrom = luaP:GETARG_A(previous)
-                local pto = luaP:GETARG_B(previous)
+            if Instruction:GET_OPCODE(previous) == "OP_LOADNIL" then
+                local pfrom = Instruction:GETARG_A(previous)
+                local pto = Instruction:GETARG_B(previous)
                 if pfrom <= from and from <= pto + 1 then
                     if from + n - 1 > pto then
-                        luaP:SETARG_B(previous, from + n - 1)
+                        Instruction:SETARG_B(previous, from + n - 1)
                     end
                     return
                 end
@@ -1153,81 +1153,81 @@ function luaK:_nil(fs, from, n)
     end
     self:codeABC(fs, "OP_LOADNIL", from, from + n - 1, 0)
 end
-function luaK:jump(fs)
+function Codegen:jump(fs)
     local jpc = fs.jpc
     fs.jpc = self.NO_JUMP
     local j = self:codeAsBx(fs, "OP_JMP", 0, self.NO_JUMP)
     j = self:concat(fs, j, jpc)
     return j
 end
-function luaK:ret(fs, first, nret)
+function Codegen:ret(fs, first, nret)
     self:codeABC(fs, "OP_RETURN", first, nret + 1, 0)
 end
-function luaK:condjump(fs, op, A, B, C)
+function Codegen:condjump(fs, op, A, B, C)
     self:codeABC(fs, op, A, B, C)
     return self:jump(fs)
 end
-function luaK:fixjump(fs, pc, dest)
+function Codegen:fixjump(fs, pc, dest)
     local jmp = fs.f.code[pc]
     local offset = dest - (pc + 1)
-    if math.abs(offset) > luaP.MAXARG_sBx then
-        luaK:syntaxerror(fs.ls, "control structure too long")
+    if math.abs(offset) > Instruction.MAXARG_sBx then
+        Lexer:syntaxerror(fs.ls, "control structure too long")
     end
-    luaP:SETARG_sBx(jmp, offset)
+    Instruction:SETARG_sBx(jmp, offset)
 end
-function luaK:getlabel(fs)
+function Codegen:getlabel(fs)
     fs.lasttarget = fs.pc
     return fs.pc
 end
-function luaK:getjump(fs, pc)
-    local offset = luaP:GETARG_sBx(fs.f.code[pc])
+function Codegen:getjump(fs, pc)
+    local offset = Instruction:GETARG_sBx(fs.f.code[pc])
     if offset == self.NO_JUMP then
         return self.NO_JUMP
     else
         return (pc + 1) + offset
     end
 end
-function luaK:getjumpcontrol(fs, pc)
+function Codegen:getjumpcontrol(fs, pc)
     local pi = fs.f.code[pc]
     local ppi = fs.f.code[pc - 1]
-    if pc >= 1 and luaP:testTMode(luaP:GET_OPCODE(ppi)) ~= 0 then
+    if pc >= 1 and Instruction:testTMode(Instruction:GET_OPCODE(ppi)) ~= 0 then
         return ppi
     else
         return pi
     end
 end
-function luaK:need_value(fs, list)
+function Codegen:need_value(fs, list)
     while list ~= self.NO_JUMP do
         local i = self:getjumpcontrol(fs, list)
-        if luaP:GET_OPCODE(i) ~= "OP_TESTSET" then
+        if Instruction:GET_OPCODE(i) ~= "OP_TESTSET" then
             return true
         end
         list = self:getjump(fs, list)
     end
     return false
 end
-function luaK:patchtestreg(fs, node, reg)
+function Codegen:patchtestreg(fs, node, reg)
     local i = self:getjumpcontrol(fs, node)
-    if luaP:GET_OPCODE(i) ~= "OP_TESTSET" then
+    if Instruction:GET_OPCODE(i) ~= "OP_TESTSET" then
         return false
     end
-    if reg ~= luaP.NO_REG and reg ~= luaP:GETARG_B(i) then
-        luaP:SETARG_A(i, reg)
+    if reg ~= Instruction.NO_REG and reg ~= Instruction:GETARG_B(i) then
+        Instruction:SETARG_A(i, reg)
     else
-        luaP:SET_OPCODE(i, "OP_TEST")
-        local b = luaP:GETARG_B(i)
-        luaP:SETARG_A(i, b)
-        luaP:SETARG_B(i, 0)
+        Instruction:SET_OPCODE(i, "OP_TEST")
+        local b = Instruction:GETARG_B(i)
+        Instruction:SETARG_A(i, b)
+        Instruction:SETARG_B(i, 0)
     end
     return true
 end
-function luaK:removevalues(fs, list)
+function Codegen:removevalues(fs, list)
     while list ~= self.NO_JUMP do
-        self:patchtestreg(fs, list, luaP.NO_REG)
+        self:patchtestreg(fs, list, Instruction.NO_REG)
         list = self:getjump(fs, list)
     end
 end
-function luaK:patchlistaux(fs, list, vtarget, reg, dtarget)
+function Codegen:patchlistaux(fs, list, vtarget, reg, dtarget)
     while list ~= self.NO_JUMP do
         local _next = self:getjump(fs, list)
         if self:patchtestreg(fs, list, reg) then
@@ -1238,22 +1238,22 @@ function luaK:patchlistaux(fs, list, vtarget, reg, dtarget)
         list = _next
     end
 end
-function luaK:dischargejpc(fs)
-    self:patchlistaux(fs, fs.jpc, fs.pc, luaP.NO_REG, fs.pc)
+function Codegen:dischargejpc(fs)
+    self:patchlistaux(fs, fs.jpc, fs.pc, Instruction.NO_REG, fs.pc)
     fs.jpc = self.NO_JUMP
 end
-function luaK:patchlist(fs, list, target)
+function Codegen:patchlist(fs, list, target)
     if target == fs.pc then
         self:patchtohere(fs, list)
     else
-        self:patchlistaux(fs, list, target, luaP.NO_REG, target)
+        self:patchlistaux(fs, list, target, Instruction.NO_REG, target)
     end
 end
-function luaK:patchtohere(fs, list)
+function Codegen:patchtohere(fs, list)
     self:getlabel(fs)
     fs.jpc = self:concat(fs, fs.jpc, list)
 end
-function luaK:concat(fs, l1, l2)
+function Codegen:concat(fs, l1, l2)
     if l2 == self.NO_JUMP then
         return l1
     elseif l1 == self.NO_JUMP then
@@ -1272,30 +1272,30 @@ function luaK:concat(fs, l1, l2)
     end
     return l1
 end
-function luaK:checkstack(fs, n)
+function Codegen:checkstack(fs, n)
     local newstack = fs.freereg + n
     if newstack > fs.f.maxstacksize then
         if newstack >= self.MAXSTACK then
-            luaK:syntaxerror(fs.ls, "function or expression too complex")
+            Lexer:syntaxerror(fs.ls, "function or expression too complex")
         end
         fs.f.maxstacksize = newstack
     end
 end
-function luaK:reserveregs(fs, n)
+function Codegen:reserveregs(fs, n)
     self:checkstack(fs, n)
     fs.freereg = fs.freereg + n
 end
-function luaK:freereg(fs, reg)
-    if not luaP:ISK(reg) and reg >= fs.nactvar then
+function Codegen:freereg(fs, reg)
+    if not Instruction:ISK(reg) and reg >= fs.nactvar then
         fs.freereg = fs.freereg - 1
     end
 end
-function luaK:freeexp(fs, e)
+function Codegen:freeexp(fs, e)
     if e.k == "VNONRELOC" then
         self:freereg(fs, e.info)
     end
 end
-function luaK:addk(fs, k, v)
+function Codegen:addk(fs, k, v)
     local idx = fs.h[k.value]
     if self:ttisnumber(idx) then
         return self:nvalue(idx)
@@ -1303,51 +1303,51 @@ function luaK:addk(fs, k, v)
     idx = {}
     self:setnvalue(idx, fs.nk)
     fs.h[k.value] = idx
-    luaY:growvector(fs.L, fs.f.k, fs.nk, fs.f.sizek, nil, luaP.MAXARG_Bx, "constant table overflow")
+    Parser:growvector(fs.L, fs.f.k, fs.nk, fs.f.sizek, nil, Instruction.MAXARG_Bx, "constant table overflow")
     fs.f.k[fs.nk] = v
     fs.nk = fs.nk + 1
     return fs.nk - 1
 end
-function luaK:stringK(fs, s)
+function Codegen:stringK(fs, s)
     local o = {}
     self:setsvalue(o, s)
     return self:addk(fs, o, o)
 end
-function luaK:numberK(fs, r)
+function Codegen:numberK(fs, r)
     local o = {}
     self:setnvalue(o, r)
     return self:addk(fs, o, o)
 end
-function luaK:boolK(fs, b)
+function Codegen:boolK(fs, b)
     local o = {}
     self:setbvalue(o, b)
     return self:addk(fs, o, o)
 end
-function luaK:nilK(fs)
+function Codegen:nilK(fs)
     local k, v = {}, {}
     self:setnilvalue(v)
     self:sethvalue(k, fs.h)
     return self:addk(fs, k, v)
 end
-function luaK:setreturns(fs, e, nresults)
+function Codegen:setreturns(fs, e, nresults)
     if e.k == "VCALL" then
-        luaP:SETARG_C(self:getcode(fs, e), nresults + 1)
+        Instruction:SETARG_C(self:getcode(fs, e), nresults + 1)
     elseif e.k == "VVARARG" then
-        luaP:SETARG_B(self:getcode(fs, e), nresults + 1)
-        luaP:SETARG_A(self:getcode(fs, e), fs.freereg)
-        luaK:reserveregs(fs, 1)
+        Instruction:SETARG_B(self:getcode(fs, e), nresults + 1)
+        Instruction:SETARG_A(self:getcode(fs, e), fs.freereg)
+        Codegen:reserveregs(fs, 1)
     end
 end
-function luaK:setoneret(fs, e)
+function Codegen:setoneret(fs, e)
     if e.k == "VCALL" then
         e.k = "VNONRELOC"
-        e.info = luaP:GETARG_A(self:getcode(fs, e))
+        e.info = Instruction:GETARG_A(self:getcode(fs, e))
     elseif e.k == "VVARARG" then
-        luaP:SETARG_B(self:getcode(fs, e), 2)
+        Instruction:SETARG_B(self:getcode(fs, e), 2)
         e.k = "VRELOCABLE"
     end
 end
-function luaK:dischargevars(fs, e)
+function Codegen:dischargevars(fs, e)
     local k = e.k
     if k == "VLOCAL" then
         e.k = "VNONRELOC"
@@ -1367,11 +1367,11 @@ function luaK:dischargevars(fs, e)
     else
     end
 end
-function luaK:code_label(fs, A, b, jump)
+function Codegen:code_label(fs, A, b, jump)
     self:getlabel(fs)
     return self:codeABC(fs, "OP_LOADBOOL", A, b, jump)
 end
-function luaK:discharge2reg(fs, e, reg)
+function Codegen:discharge2reg(fs, e, reg)
     self:dischargevars(fs, e)
     local k = e.k
     if k == "VNIL" then
@@ -1395,13 +1395,13 @@ function luaK:discharge2reg(fs, e, reg)
     e.info = reg
     e.k = "VNONRELOC"
 end
-function luaK:discharge2anyreg(fs, e)
+function Codegen:discharge2anyreg(fs, e)
     if e.k ~= "VNONRELOC" then
         self:reserveregs(fs, 1)
         self:discharge2reg(fs, e, fs.freereg - 1)
     end
 end
-function luaK:exp2reg(fs, e, reg)
+function Codegen:exp2reg(fs, e, reg)
     self:discharge2reg(fs, e, reg)
     if e.k == "VJMP" then
         e.t = self:concat(fs, e.t, e.info)
@@ -1424,13 +1424,13 @@ function luaK:exp2reg(fs, e, reg)
     e.info = reg
     e.k = "VNONRELOC"
 end
-function luaK:exp2nextreg(fs, e)
+function Codegen:exp2nextreg(fs, e)
     self:dischargevars(fs, e)
     self:freeexp(fs, e)
     self:reserveregs(fs, 1)
     self:exp2reg(fs, e, fs.freereg - 1)
 end
-function luaK:exp2anyreg(fs, e)
+function Codegen:exp2anyreg(fs, e)
     self:dischargevars(fs, e)
     if e.k == "VNONRELOC" then
         if not self:hasjumps(e) then
@@ -1444,38 +1444,42 @@ function luaK:exp2anyreg(fs, e)
     self:exp2nextreg(fs, e)
     return e.info
 end
-function luaK:exp2val(fs, e)
+function Codegen:exp2val(fs, e)
     if self:hasjumps(e) then
         self:exp2anyreg(fs, e)
     else
         self:dischargevars(fs, e)
     end
 end
-function luaK:exp2RK(fs, e)
-    luaK:exp2val(fs, e)
+function Codegen:exp2RK(fs, e)
+    Codegen:exp2val(fs, e)
     local k = e.k
     if k == "VKNUM" or k == "VTRUE" or k == "VFALSE" or k == "VNIL" then
-        if fs.nk <= luaP.MAXINDEXRK then
+        if fs.nk <= Instruction.MAXINDEXRK then
             if k == "VNIL" then
                 local o = {}
-                luaK:setnilvalue(o)
+                Codegen:setnilvalue(o)
                 local k_obj = {}
-                luaK:sethvalue(k_obj, fs.h)
-                e.info = luaK:addk(fs, k_obj, o)
+                Codegen:sethvalue(k_obj, fs.h)
+                e.info = Codegen:addk(fs, k_obj, o)
             else
-                e.info = (k == "VKNUM") and luaK:numberK(fs, e.nval) or luaK:boolK(fs, k == "VTRUE")
+                e.info = (k == "VKNUM") and Codegen:numberK(fs, e.nval) or Codegen:boolK(fs, k == "VTRUE")
             end
             e.k = "VK"
-            return luaP:RKASK(e.info)
+            return Instruction:RKASK(e.info)
         end
-    elseif k == "VK" and e.info <= luaP.MAXINDEXRK then
-        return luaP:RKASK(e.info)
+    elseif k == "VK" and e.info <= Instruction.MAXINDEXRK then
+        return Instruction:RKASK(e.info)
     end
-    return luaK:exp2anyreg(fs, e)
+    return Codegen:exp2anyreg(fs, e)
 end
-function luaK:storevar(fs, var, ex)
+function Codegen:storevar(fs, var, ex)
     local k = var.k
     if k == "VLOCAL" then
+        local locvar = Parser:getlocvar(fs, var.info)
+        if locvar.is_const then
+            Lexer:syntaxerror(fs.ls, "attempt to assign to const variable")
+        end
         self:freeexp(fs, ex)
         self:exp2reg(fs, ex, var.info)
         return
@@ -1492,7 +1496,7 @@ function luaK:storevar(fs, var, ex)
     end
     self:freeexp(fs, ex)
 end
-function luaK:_self(fs, e, key)
+function Codegen:_self(fs, e, key)
     self:exp2anyreg(fs, e)
     self:freeexp(fs, e)
     local func = fs.freereg
@@ -1502,23 +1506,23 @@ function luaK:_self(fs, e, key)
     e.info = func
     e.k = "VNONRELOC"
 end
-function luaK:invertjump(fs, e)
+function Codegen:invertjump(fs, e)
     local pc = self:getjumpcontrol(fs, e.info)
-    luaP:SETARG_A(pc, (luaP:GETARG_A(pc) == 0) and 1 or 0)
+    Instruction:SETARG_A(pc, (Instruction:GETARG_A(pc) == 0) and 1 or 0)
 end
-function luaK:jumponcond(fs, e, cond)
+function Codegen:jumponcond(fs, e, cond)
     if e.k == "VRELOCABLE" then
         local ie = self:getcode(fs, e)
-        if luaP:GET_OPCODE(ie) == "OP_NOT" then
+        if Instruction:GET_OPCODE(ie) == "OP_NOT" then
             fs.pc = fs.pc - 1
-            return self:condjump(fs, "OP_TEST", luaP:GETARG_B(ie), 0, cond and 0 or 1)
+            return self:condjump(fs, "OP_TEST", Instruction:GETARG_B(ie), 0, cond and 0 or 1)
         end
     end
     self:discharge2anyreg(fs, e)
     self:freeexp(fs, e)
-    return self:condjump(fs, "OP_TESTSET", luaP.NO_REG, e.info, cond and 1 or 0)
+    return self:condjump(fs, "OP_TESTSET", Instruction.NO_REG, e.info, cond and 1 or 0)
 end
-function luaK:goiftrue(fs, e)
+function Codegen:goiftrue(fs, e)
     local pc
     self:dischargevars(fs, e)
     local k = e.k
@@ -1536,7 +1540,7 @@ function luaK:goiftrue(fs, e)
     self:patchtohere(fs, e.t)
     e.t = self.NO_JUMP
 end
-function luaK:goiffalse(fs, e)
+function Codegen:goiffalse(fs, e)
     local pc
     self:dischargevars(fs, e)
     local k = e.k
@@ -1553,7 +1557,7 @@ function luaK:goiffalse(fs, e)
     self:patchtohere(fs, e.f)
     e.f = self.NO_JUMP
 end
-function luaK:codenot(fs, e)
+function Codegen:codenot(fs, e)
     self:dischargevars(fs, e)
     local k = e.k
     if k == "VNIL" or k == "VFALSE" then
@@ -1573,11 +1577,11 @@ function luaK:codenot(fs, e)
     self:removevalues(fs, e.f)
     self:removevalues(fs, e.t)
 end
-function luaK:indexed(fs, t, k)
+function Codegen:indexed(fs, t, k)
     t.aux = self:exp2RK(fs, k)
     t.k = "VINDEXED"
 end
-function luaK:code_floor(fs, src_reg, dest_reg)
+function Codegen:code_floor(fs, src_reg, dest_reg)
     local math_idx = self:stringK(fs, "math")
     local floor_idx = self:stringK(fs, "floor")
     local func_reg = fs.freereg
@@ -1589,7 +1593,7 @@ function luaK:code_floor(fs, src_reg, dest_reg)
     self:codeABC(fs, "OP_MOVE", dest_reg, func_reg, 0)
     fs.freereg = func_reg
 end
-function luaK:constfolding(op, e1, e2)
+function Codegen:constfolding(op, e1, e2)
     local v1, v2
     if e1.k == "VKNUM" then
         v1 = e1.nval
@@ -1633,7 +1637,7 @@ function luaK:constfolding(op, e1, e2)
     e1.nval, e1.k = r, "VKNUM"
     return true
 end
-function luaK:codearith(fs, op, e1, e2)
+function Codegen:codearith(fs, op, e1, e2)
     if self:constfolding(op, e1, e2) then
         return
     else
@@ -1663,7 +1667,7 @@ function luaK:codearith(fs, op, e1, e2)
         end
     end
 end
-function luaK:codecomp(fs, op, cond, e1, e2)
+function Codegen:codecomp(fs, op, cond, e1, e2)
     local o1 = self:exp2RK(fs, e1)
     local o2 = self:exp2RK(fs, e2)
     self:freeexp(fs, e2)
@@ -1675,7 +1679,7 @@ function luaK:codecomp(fs, op, cond, e1, e2)
     e1.info = self:condjump(fs, op, cond, o1, o2)
     e1.k = "VJMP"
 end
-function luaK:prefix(fs, op, e)
+function Codegen:prefix(fs, op, e)
     local e2 = {}
     e2.t, e2.f = self.NO_JUMP, self.NO_JUMP
     e2.k = "VKNUM"
@@ -1693,7 +1697,7 @@ function luaK:prefix(fs, op, e)
     else
     end
 end
-function luaK:infix(fs, op, v)
+function Codegen:infix(fs, op, v)
     if op == "OPR_AND" then
         self:goiftrue(fs, v)
     elseif op == "OPR_OR" then
@@ -1710,7 +1714,7 @@ function luaK:infix(fs, op, v)
         self:exp2RK(fs, v)
     end
 end
-luaK.arith_op = {
+Codegen.arith_op = {
     OPR_ADD = "OP_ADD",
     OPR_SUB = "OP_SUB",
     OPR_MUL = "OP_MUL",
@@ -1719,7 +1723,7 @@ luaK.arith_op = {
     OPR_POW = "OP_POW",
     OPR_FLOORDIV = "OP_FLOORDIV"
 }
-luaK.comp_op = {
+Codegen.comp_op = {
     OPR_EQ = "OP_EQ",
     OPR_NE = "OP_EQ",
     OPR_LT = "OP_LT",
@@ -1727,8 +1731,8 @@ luaK.comp_op = {
     OPR_GT = "OP_LT",
     OPR_GE = "OP_LE"
 }
-luaK.comp_cond = {OPR_EQ = 1, OPR_NE = 0, OPR_LT = 1, OPR_LE = 1, OPR_GT = 0, OPR_GE = 0}
-function luaK:posfix(fs, op, e1, e2)
+Codegen.comp_cond = {OPR_EQ = 1, OPR_NE = 0, OPR_LT = 1, OPR_LE = 1, OPR_GT = 0, OPR_GE = 0}
+function Codegen:posfix(fs, op, e1, e2)
     local function copyexp(e1, e2)
         e1.k = e2.k
         e1.info = e2.info
@@ -1747,9 +1751,9 @@ function luaK:posfix(fs, op, e1, e2)
         copyexp(e1, e2)
     elseif op == "OPR_CONCAT" or op == "OPR_CONCAT2" then
         self:exp2val(fs, e2)
-        if e2.k == "VRELOCABLE" and luaP:GET_OPCODE(self:getcode(fs, e2)) == "OP_CONCAT" then
+        if e2.k == "VRELOCABLE" and Instruction:GET_OPCODE(self:getcode(fs, e2)) == "OP_CONCAT" then
             self:freeexp(fs, e1)
-            luaP:SETARG_B(self:getcode(fs, e2), e1.info)
+            Instruction:SETARG_B(self:getcode(fs, e2), e1.info)
             e1.k = "VRELOCABLE"
             e1.info = e2.info
         else
@@ -1757,7 +1761,7 @@ function luaK:posfix(fs, op, e1, e2)
             self:codearith(fs, "OP_CONCAT", e1, e2)
         end
     else
-        local arith = self.arith_op[op] or self.arith_op[string.gsub(op, "2", "")]
+        local arith = self.arith_op[op]
         if arith then
             self:codearith(fs, arith, e1, e2)
         else
@@ -1765,69 +1769,70 @@ function luaK:posfix(fs, op, e1, e2)
             if comp then
                 self:codecomp(fs, comp, self.comp_cond[op], e1, e2)
             else
+                Lexer:syntaxerror(fs.ls, string.format("unsupported binary operator '%s'", op))
             end
         end
     end
 end
-function luaK:fixline(fs, line)
+function Codegen:fixline(fs, line)
     fs.f.lineinfo[fs.pc - 1] = line
 end
-function luaK:code(fs, i, line)
+function Codegen:code(fs, i, line)
     local f = fs.f
     self:dischargejpc(fs)
-    luaY:growvector(fs.L, f.code, fs.pc, f.sizecode, nil, luaY.MAX_INT, "code size overflow")
+    Parser:growvector(fs.L, f.code, fs.pc, f.sizecode, nil, Parser.MAX_INT, "code size overflow")
     f.code[fs.pc] = i
-    luaY:growvector(fs.L, f.lineinfo, fs.pc, f.sizelineinfo, nil, luaY.MAX_INT, "code size overflow")
+    Parser:growvector(fs.L, f.lineinfo, fs.pc, f.sizelineinfo, nil, Parser.MAX_INT, "code size overflow")
     f.lineinfo[fs.pc] = line
     local pc = fs.pc
     fs.pc = fs.pc + 1
     return pc
 end
-function luaK:codeABC(fs, o, a, b, c)
-    local i = {OP = luaP.OpCode[o], A = a, B = b, C = c}
+function Codegen:codeABC(fs, o, a, b, c)
+    local i = {OP = Instruction.OpCode[o], A = a, B = b, C = c}
     local f = fs.f
-    luaK:dischargejpc(fs)
-    luaY:growvector(fs.L, f.code, fs.pc, f.sizecode, nil, luaY.MAX_INT, "code size overflow")
+    Codegen:dischargejpc(fs)
+    Parser:growvector(fs.L, f.code, fs.pc, f.sizecode, nil, Parser.MAX_INT, "code size overflow")
     f.code[fs.pc] = i
-    luaY:growvector(fs.L, f.lineinfo, fs.pc, f.sizelineinfo, nil, luaY.MAX_INT, "code size overflow")
+    Parser:growvector(fs.L, f.lineinfo, fs.pc, f.sizelineinfo, nil, Parser.MAX_INT, "code size overflow")
     f.lineinfo[fs.pc] = fs.ls.lastline
     local pc = fs.pc
     fs.pc = fs.pc + 1
     return pc
 end
-function luaK:codeABx(fs, o, a, bc)
-    return self:code(fs, luaP:CREATE_ABx(o, a, bc), fs.ls.lastline)
+function Codegen:codeABx(fs, o, a, bc)
+    return self:code(fs, Instruction:CREATE_ABx(o, a, bc), fs.ls.lastline)
 end
-function luaK:setlist(fs, base, nelems, tostore)
-    local c = math.floor((nelems - 1) / luaP.LFIELDS_PER_FLUSH) + 1
-    local b = (tostore == luaY.LUA_MULTRET) and 0 or tostore
-    if c <= luaP.MAXARG_C then
+function Codegen:setlist(fs, base, nelems, tostore)
+    local c = math.floor((nelems - 1) / Instruction.LFIELDS_PER_FLUSH) + 1
+    local b = (tostore == Parser.LUA_MULTRET) and 0 or tostore
+    if c <= Instruction.MAXARG_C then
         self:codeABC(fs, "OP_SETLIST", base, b, c)
     else
         self:codeABC(fs, "OP_SETLIST", base, b, 0)
-        self:code(fs, luaP:CREATE_Inst(c), fs.ls.lastline)
+        self:code(fs, Instruction:CREATE_Inst(c), fs.ls.lastline)
     end
     fs.freereg = base + 1
 end
-luaY.SHRT_MAX = 32767
-luaY.LUAI_MAXVARS = 200
-luaY.LUAI_MAXUPVALUES = 60
-luaY.MAX_INT = luaK.MAX_INT or 2147483645
-luaY.LUAI_MAXCCALLS = 200
-luaY.VARARG_HASARG = 1
-luaY.HASARG_MASK = 2
-luaY.VARARG_ISVARARG = 2
-luaY.VARARG_NEEDSARG = 4
-luaY.LUA_MULTRET = -1
-function luaY:LUA_QL(x)
+Parser.SHRT_MAX = 32767
+Parser.LUAI_MAXVARS = 200
+Parser.LUAI_MAXUPVALUES = 60
+Parser.MAX_INT = Lexer.MAX_INT or 2147483645
+Parser.LUAI_MAXCCALLS = 200
+Parser.VARARG_HASARG = 1
+Parser.HASARG_MASK = 2
+Parser.VARARG_ISVARARG = 2
+Parser.VARARG_NEEDSARG = 4
+Parser.LUA_MULTRET = -1
+function Parser:LUA_QL(x)
     return "'" .. x .. "'"
 end
-function luaY:growvector(L, v, nelems, size, t, limit, e)
+function Parser:growvector(L, v, nelems, size, t, limit, e)
     if nelems >= limit then
         error(e)
     end
 end
-function luaY:newproto(L)
+function Parser:newproto(L)
     local f = {}
     f.k = {}
     f.sizek = 0
@@ -1850,7 +1855,7 @@ function luaY:newproto(L)
     f.source = nil
     return f
 end
-function luaY:int2fb(x)
+function Parser:int2fb(x)
     local e = 0
     while x >= 16 do
         x = math.floor((x + 1) / 2)
@@ -1862,120 +1867,139 @@ function luaY:int2fb(x)
         return ((e + 1) * 8) + (x - 8)
     end
 end
-function luaY:hasmultret(k)
+function Parser:hasmultret(k)
     return k == "VCALL" or k == "VVARARG"
 end
-function luaY:getlocvar(fs, i)
+function Parser:getlocvar(fs, i)
     return fs.f.locvars[fs.actvar[i]]
 end
-function luaY:checklimit(fs, v, l, m)
+function Parser:checklimit(fs, v, l, m)
     if v > l then
         self:errorlimit(fs, l, m)
     end
 end
-function luaY:anchor_token(ls)
+function Parser:anchor_token(ls)
     if ls.t.token == "TK_NAME" or ls.t.token == "TK_STRING" then
     end
 end
-function luaY:error_expected(ls, token)
-    luaK:syntaxerror(ls, string.format("'%s' expected", luaK:token2str(ls, token)))
+function Parser:error_expected(ls, token)
+    Lexer:syntaxerror(ls, string.format("'%s' expected", Lexer:token2str(ls, token)))
 end
-function luaY:errorlimit(fs, limit, what)
+function Parser:errorlimit(fs, limit, what)
     local msg =
         (fs.f.linedefined == 0) and string.format("main function has more than %d %s", limit, what) or
         string.format("function at line %d has more than %d %s", fs.f.linedefined, limit, what)
-    luaK:lexerror(fs.ls, msg, 0)
+    Lexer:lexererror(fs.ls, msg, 0)
 end
-function luaY:testnext(ls, c)
+function Parser:testnext(ls, c)
     if ls.t.token == c then
-        luaK:next(ls)
+        Lexer:next(ls)
         return true
     else
         return false
     end
 end
-function luaY:check(ls, c)
+function Parser:check(ls, c)
     if ls.t.token ~= c then
         self:error_expected(ls, c)
     end
 end
-function luaY:checknext(ls, c)
+function Parser:checknext(ls, c)
     self:check(ls, c)
-    luaK:next(ls)
+    Lexer:next(ls)
 end
-function luaY:check_condition(ls, c, msg)
+function Parser:check_condition(ls, c, msg)
     if not c then
-        luaK:syntaxerror(ls, msg)
+        Lexer:syntaxerror(ls, msg)
     end
 end
-function luaY:check_match(ls, what, who, where)
+function Parser:check_match(ls, what, who, where)
     if not self:testnext(ls, what) then
-        luaK:syntaxerror(
+        Lexer:syntaxerror(
             ls,
-            where == ls.linenumber and self.LUA_QS:format(luaK:token2str(ls, what)) .. " expected" or
-                self.LUA_QS:format(luaK:token2str(ls, what)) ..
-                    " expected (to close " .. self.LUA_QS:format(luaK:token2str(ls, who)) .. " at line %d)",
+            where == ls.linenumber and self.LUA_QS:format(Lexer:token2str(ls, what)) .. " expected" or
+                self.LUA_QS:format(Lexer:token2str(ls, what)) ..
+                    " expected (to close " .. self.LUA_QS:format(Lexer:token2str(ls, who)) .. " at line %d)",
             where
         )
     end
 end
-function luaY:str_checkname(ls)
+function Parser:str_checkname(ls)
     self:check(ls, "TK_NAME")
     local ts = ls.t.seminfo
-    luaK:next(ls)
+    Lexer:next(ls)
     return ts
 end
-function luaY:init_exp(e, k, i)
-    e.f, e.t = luaK.NO_JUMP, luaK.NO_JUMP
+function Parser:init_exp(e, k, i)
+    e.f, e.t = Codegen.NO_JUMP, Codegen.NO_JUMP
     e.k = k
     e.info = i
     e.nval = nil
     e.aux = nil
     return e
 end
-function luaY:codestring(ls, e, s)
-    e.f, e.t = luaK.NO_JUMP, luaK.NO_JUMP
+function Parser:codestring(ls, e, s)
+    e.f, e.t = Codegen.NO_JUMP, Codegen.NO_JUMP
     e.k = "VK"
-    e.info = luaK:stringK(ls.fs, s)
+    e.info = Codegen:stringK(ls.fs, s)
     e.nval = nil
     e.aux = nil
 end
-function luaY:checkname(ls, e)
-    self:codestring(ls, e, self:str_checkname(ls))
+local function is_valid_type(type_name)
+    return true
 end
-function luaY:registerlocalvar(ls, varname)
+local function emit_type_check(fs, reg, expected_type, line)
+end
+function Parser:checkname(ls, e, allow_type)
+    self:check(ls, "TK_NAME")
+    local name = ls.t.seminfo
+    Lexer:next(ls)
+    local type_annot = nil
+    if allow_type and ls.t.token == ":" then
+        Lexer:next(ls)
+        self:check(ls, "TK_NAME")
+        type_annot = ls.t.seminfo
+        if not is_valid_type(type_annot) then
+            Lexer:syntaxerror(ls, string.format("Invalid type annotation '%s'", type_annot))
+        end
+        Lexer:next(ls)
+    end
+    self:codestring(ls, e, name)
+    return name, type_annot
+end
+function Parser:registerlocalvar(ls, varname, is_const, is_close)
     local fs = ls.fs
     local f = fs.f
     self:growvector(ls.L, f.locvars, fs.nlocvars, f.sizelocvars, nil, self.SHRT_MAX, "too many local variables")
-    f.locvars[fs.nlocvars] = {}
-    f.locvars[fs.nlocvars].varname = varname
+    f.locvars[fs.nlocvars] = {varname = varname, is_const = is_const or false, is_close = is_close or false}
     local nlocvars = fs.nlocvars
     fs.nlocvars = fs.nlocvars + 1
     return nlocvars
 end
-function luaY:new_localvarliteral(ls, v, n)
+function Parser:new_localvarliteral(ls, v, n)
     self:new_localvar(ls, v, n)
 end
-function luaY:new_localvar(ls, name, n)
+function Parser:new_localvar(ls, name, n, is_const, is_close)
     local fs = ls.fs
     self:checklimit(fs, fs.nactvar + n + 1, self.LUAI_MAXVARS, "local variables")
-    fs.actvar[fs.nactvar + n] = self:registerlocalvar(ls, name)
+    fs.actvar[fs.nactvar + n] = self:registerlocalvar(ls, name, is_const, is_close)
 end
-function luaY:adjustlocalvars(ls, nvars)
+function Parser:adjustlocalvars(ls, nvars)
     local fs = ls.fs
     fs.nactvar = fs.nactvar + nvars
     for i = nvars, 1, -1 do
         self:getlocvar(fs, fs.nactvar - i).startpc = fs.pc
     end
 end
-function luaY:removevars(ls, tolevel)
+function Parser:removevars(ls, tolevel)
     local fs = ls.fs
     while fs.nactvar > tolevel do
         fs.nactvar = fs.nactvar - 1
-        self:getlocvar(fs, fs.nactvar).endpc = fs.pc
+        local locvar = self:getlocvar(fs, fs.nactvar)
+        locvar.endpc = fs.pc
     end
 end
-function luaY:indexupvalue(fs, name, v)
+function Parser:indexupvalue(fs, name, v)
     local f = fs.f
     for i = 0, f.nups - 1 do
         if fs.upvalues[i].k == v.k and fs.upvalues[i].info == v.info then
@@ -1990,7 +2014,7 @@ function luaY:indexupvalue(fs, name, v)
     f.nups = f.nups + 1
     return nups
 end
-function luaY:searchvar(fs, n)
+function Parser:searchvar(fs, n)
     for i = fs.nactvar - 1, 0, -1 do
         if n == self:getlocvar(fs, i).varname then
             return i
@@ -1998,7 +2022,7 @@ function luaY:searchvar(fs, n)
     end
     return -1
 end
-function luaY:markupval(fs, level)
+function Parser:markupval(fs, level)
     local bl = fs.bl
     while bl and bl.nactvar > level do
         bl = bl.previous
@@ -2007,9 +2031,9 @@ function luaY:markupval(fs, level)
         bl.upval = true
     end
 end
-function luaY:singlevaraux(fs, n, var, base)
+function Parser:singlevaraux(fs, n, var, base)
     if fs == nil then
-        self:init_exp(var, "VGLOBAL", luaP.NO_REG)
+        self:init_exp(var, "VGLOBAL", Instruction.NO_REG)
         return "VGLOBAL"
     else
         local v = self:searchvar(fs, n)
@@ -2029,78 +2053,78 @@ function luaY:singlevaraux(fs, n, var, base)
         end
     end
 end
-function luaY:singlevar(ls, var)
+function Parser:singlevar(ls, var)
     local varname = self:str_checkname(ls)
     local fs = ls.fs
     if self:singlevaraux(fs, varname, var, 1) == "VGLOBAL" then
-        var.info = luaK:stringK(fs, varname)
+        var.info = Codegen:stringK(fs, varname)
     end
 end
-function luaY:adjust_assign(ls, nvars, nexps, e)
+function Parser:adjust_assign(ls, nvars, nexps, e)
     local fs, extra = ls.fs, nvars - nexps
     if self:hasmultret(e.k) then
         extra = extra + 1
-        luaK:setreturns(fs, e, extra < 0 and 0 or extra)
+        Codegen:setreturns(fs, e, extra < 0 and 0 or extra)
         if extra > 1 then
-            luaK:reserveregs(fs, extra - 1)
+            Codegen:reserveregs(fs, extra - 1)
         end
     else
         if e.k ~= "VVOID" then
-            luaK:exp2nextreg(fs, e)
+            Codegen:exp2nextreg(fs, e)
         end
         if extra > 0 then
-            luaK:_nil(fs, fs.freereg, extra)
-            luaK:reserveregs(fs, extra)
+            Codegen:_nil(fs, fs.freereg, extra)
+            Codegen:reserveregs(fs, extra)
         elseif nexps == 1 and nvars > 1 then
             local reg = fs.freereg - 1
-            luaK:reserveregs(fs, nvars - 1)
+            Codegen:reserveregs(fs, nvars - 1)
             for i = 1, nvars - 1 do
-                luaK:codeABC(fs, "OP_MOVE", reg + i, reg, 0)
+                Codegen:codeABC(fs, "OP_MOVE", reg + i, reg, 0)
             end
         end
     end
 end
-function luaY:enterlevel(ls)
+function Parser:enterlevel(ls)
     ls.L.nCcalls = ls.L.nCcalls + 1
     if ls.L.nCcalls > self.LUAI_MAXCCALLS then
-        luaK:lexerror(ls, "chunk has too many syntax levels", 0)
+        Lexer:lexererror(ls, "chunk has too many syntax levels", 0)
     end
 end
-function luaY:leavelevel(ls)
+function Parser:leavelevel(ls)
     ls.L.nCcalls = ls.L.nCcalls - 1
 end
-function luaY:enterblock(fs, bl, isbreakable)
-    bl.breaklist = luaK.NO_JUMP
-    bl.continuelist = luaK.NO_JUMP
+function Parser:enterblock(fs, bl, isbreakable)
+    bl.breaklist = Codegen.NO_JUMP
+    bl.continuelist = Codegen.NO_JUMP
     bl.isbreakable = isbreakable
     bl.nactvar = fs.nactvar
     bl.upval = false
     bl.previous = fs.bl
     fs.bl = bl
 end
-function luaY:leaveblock(fs)
+function Parser:leaveblock(fs)
     local bl = fs.bl
     fs.bl = bl.previous
     self:removevars(fs.ls, bl.nactvar)
     if bl.upval then
-        luaK:codeABC(fs, "OP_CLOSE", bl.nactvar, 0, 0)
+        Codegen:codeABC(fs, "OP_CLOSE", bl.nactvar, 0, 0)
     end
     fs.freereg = fs.nactvar
-    luaK:patchtohere(fs, bl.breaklist)
+    Codegen:patchtohere(fs, bl.breaklist)
 end
-function luaY:pushclosure(ls, func, v)
+function Parser:pushclosure(ls, func, v)
     local fs = ls.fs
     local f = fs.f
-    self:growvector(ls.L, f.p, fs.np, f.sizep, nil, luaP.MAXARG_Bx, "constant table overflow")
+    self:growvector(ls.L, f.p, fs.np, f.sizep, nil, Instruction.MAXARG_Bx, "constant table overflow")
     f.p[fs.np] = func.f
     fs.np = fs.np + 1
-    self:init_exp(v, "VRELOCABLE", luaK:codeABx(fs, "OP_CLOSURE", 0, fs.np - 1))
+    self:init_exp(v, "VRELOCABLE", Codegen:codeABx(fs, "OP_CLOSURE", 0, fs.np - 1))
     for i = 0, func.f.nups - 1 do
         local o = (func.upvalues[i].k == "VLOCAL") and "OP_MOVE" or "OP_GETUPVAL"
-        luaK:codeABC(fs, o, 0, func.upvalues[i].info, 0)
+        Codegen:codeABC(fs, o, 0, func.upvalues[i].info, 0)
     end
 end
-function luaY:open_func(ls, fs)
+function Parser:open_func(ls, fs)
     local L = ls.L
     local f = self:newproto(ls.L)
     fs.f = f
@@ -2110,7 +2134,7 @@ function luaY:open_func(ls, fs)
     ls.fs = fs
     fs.pc = 0
     fs.lasttarget = -1
-    fs.jpc = luaK.NO_JUMP
+    fs.jpc = Codegen.NO_JUMP
     fs.freereg = 0
     fs.nk = 0
     fs.np = 0
@@ -2127,19 +2151,29 @@ function luaY:open_func(ls, fs)
     f.maxstacksize = 2
     fs.h = {}
 end
-function luaY:close_func(ls)
-    local L = ls.L
+function Parser:close_func(ls)
     local fs = ls.fs
     local f = fs.f
     self:removevars(ls, 0)
-    luaK:ret(fs, 0, 0)
+    Codegen:ret(fs, 0, 0)
     for i = 0, fs.npendinggotos - 1 do
         local g = fs.pendinggotos[i]
         local target = self:searchlabel(fs, g.label)
         if target < 0 then
-            luaK:syntaxerror(ls, string.format("label '%s' not found", g.label))
+            Lexer:syntaxerror(ls, string.format("label '%s' not found", g.label))
         end
-        luaK:fixjump(fs, g.pc, target)
+        local label_nactvar = -1
+        for j = 0, fs.nlabels - 1 do
+            local lbl = fs.labels[j]
+            if lbl.name == g.label then
+                label_nactvar = lbl.nactvar
+                break
+            end
+        end
+        if label_nactvar > g.nactvar then
+            Lexer:syntaxerror(ls, "goto skips local variable declaration")
+        end
+        Codegen:fixjump(fs, g.pc, target)
     end
     f.sizecode = fs.pc
     f.sizelineinfo = fs.pc
@@ -2148,98 +2182,101 @@ function luaY:close_func(ls)
     f.sizelocvars = fs.nlocvars
     f.sizeupvalues = f.nups
     ls.fs = fs.prev
-    if fs then
-        self:anchor_token(ls)
-    end
 end
-function luaY:parser(L, z, buff, name)
+function Parser:parser(L, z, buff, name)
     local lexstate = {t = {}, lookahead = {}}
     local funcstate = {upvalues = {}, actvar = {}}
     L.nCcalls = 0
     lexstate.buff = buff
-    luaK:setinput(L, lexstate, z, name)
-    luaY:open_func(lexstate, funcstate)
-    funcstate.f.is_vararg = luaY.VARARG_ISVARARG
-    luaK:next(lexstate)
-    luaY:chunk(lexstate)
-    luaY:checknext(lexstate, "TK_EOS")
-    luaY:close_func(lexstate)
+    Lexer:setinput(L, lexstate, z, name)
+    Parser:open_func(lexstate, funcstate)
+    funcstate.f.is_vararg = Parser.VARARG_ISVARARG
+    Lexer:next(lexstate)
+    Parser:chunk(lexstate)
+    Parser:checknext(lexstate, "TK_EOS")
+    Parser:close_func(lexstate)
     return funcstate.f
 end
-function luaY:field(ls, v)
+function Parser:field(ls, v)
     local fs = ls.fs
     local key = {}
-    luaK:exp2anyreg(fs, v)
-    luaK:next(ls)
+    Codegen:exp2anyreg(fs, v)
+    Lexer:next(ls)
     self:checkname(ls, key)
-    luaK:indexed(fs, v, key)
+    Codegen:indexed(fs, v, key)
 end
-function luaY:yindex(ls, v)
-    luaK:next(ls)
+function Parser:yindex(ls, v)
+    Lexer:next(ls)
     self:expr(ls, v)
-    luaK:exp2val(ls.fs, v)
+    Codegen:exp2val(ls.fs, v)
     self:checknext(ls, "]")
 end
-function luaY:recfield(ls, cc)
+function Parser:recfield(ls, cc)
     local fs = ls.fs
     local reg = ls.fs.freereg
     local key, val = {}, {}
+    local type_annot = nil
     if ls.t.token == "TK_NAME" then
         self:checklimit(fs, cc.nh, self.MAX_INT, "items in a constructor")
-        self:checkname(ls, key)
+        local name
+        name, type_annot = self:checkname(ls, key, true)
     else
         self:yindex(ls, key)
     end
     cc.nh = cc.nh + 1
     self:checknext(ls, "=")
-    local rkkey = luaK:exp2RK(fs, key)
+    local rkkey = Codegen:exp2RK(fs, key)
     self:expr(ls, val)
-    luaK:codeABC(fs, "OP_SETTABLE", cc.t.info, rkkey, luaK:exp2RK(fs, val))
+    if type_annot then
+        local val_reg = Codegen:exp2anyreg(fs, val)
+        emit_type_check(fs, val_reg, type_annot, ls.linenumber)
+    end
+    Codegen:codeABC(fs, "OP_SETTABLE", cc.t.info, rkkey, Codegen:exp2RK(fs, val))
     fs.freereg = reg
 end
-function luaY:closelistfield(fs, cc)
+function Parser:closelistfield(fs, cc)
     if cc.v.k == "VVOID" then
         return
     end
-    luaK:exp2nextreg(fs, cc.v)
+    Codegen:exp2nextreg(fs, cc.v)
     cc.v.k = "VVOID"
-    if cc.tostore == luaP.LFIELDS_PER_FLUSH then
-        luaK:setlist(fs, cc.t.info, cc.na, cc.tostore)
+    if cc.tostore == Instruction.LFIELDS_PER_FLUSH then
+        Codegen:setlist(fs, cc.t.info, cc.na, cc.tostore)
         cc.tostore = 0
     end
 end
-function luaY:lastlistfield(fs, cc)
+function Parser:lastlistfield(fs, cc)
     if cc.tostore == 0 then
         return
     end
     if self:hasmultret(cc.v.k) then
-        luaK:setmultret(fs, cc.v)
-        luaK:setlist(fs, cc.t.info, cc.na, self.LUA_MULTRET)
+        Codegen:setmultret(fs, cc.v)
+        Codegen:setlist(fs, cc.t.info, cc.na, self.LUA_MULTRET)
         cc.na = cc.na - 1
     else
         if cc.v.k ~= "VVOID" then
-            luaK:exp2nextreg(fs, cc.v)
+            Codegen:exp2nextreg(fs, cc.v)
         end
-        luaK:setlist(fs, cc.t.info, cc.na, cc.tostore)
+        Codegen:setlist(fs, cc.t.info, cc.na, cc.tostore)
     end
 end
-function luaY:listfield(ls, cc)
+function Parser:listfield(ls, cc)
     self:expr(ls, cc.v)
     self:checklimit(ls.fs, cc.na, self.MAX_INT, "items in a constructor")
     cc.na = cc.na + 1
     cc.tostore = cc.tostore + 1
 end
-function luaY:constructor(ls, t)
+function Parser:constructor(ls, t)
     local fs = ls.fs
     local line = ls.linenumber
-    local pc = luaK:codeABC(fs, "OP_NEWTABLE", 0, 0, 0)
+    local pc = Codegen:codeABC(fs, "OP_NEWTABLE", 0, 0, 0)
     local cc = {}
     cc.v = {}
     cc.na, cc.nh, cc.tostore = 0, 0, 0
     cc.t = t
     self:init_exp(t, "VRELOCABLE", pc)
     self:init_exp(cc.v, "VVOID", 0)
-    luaK:exp2nextreg(ls.fs, t)
+    Codegen:exp2nextreg(ls.fs, t)
     self:checknext(ls, "{")
     repeat
         if ls.t.token == "}" then
@@ -2248,7 +2285,7 @@ function luaY:constructor(ls, t)
         self:closelistfield(fs, cc)
         local c = ls.t.token
         if c == "TK_NAME" then
-            luaK:lookahead(ls)
+            Lexer:lookahead(ls)
             if ls.lookahead.token ~= "=" then
                 self:listfield(ls, cc)
             else
@@ -2262,36 +2299,43 @@ function luaY:constructor(ls, t)
     until not self:testnext(ls, ",") and not self:testnext(ls, ";")
     self:check_match(ls, "}", "{", line)
     self:lastlistfield(fs, cc)
-    luaP:SETARG_B(fs.f.code[pc], self:int2fb(cc.na))
-    luaP:SETARG_C(fs.f.code[pc], self:int2fb(cc.nh))
+    Instruction:SETARG_B(fs.f.code[pc], self:int2fb(cc.na))
+    Instruction:SETARG_C(fs.f.code[pc], self:int2fb(cc.nh))
 end
-function luaY:parlist(ls)
+function Parser:parlist(ls)
     local fs = ls.fs
     local f = fs.f
     local nparams = 0
+    local param_types = {}
     f.is_vararg = 0
     if ls.t.token ~= ")" then
         repeat
             local c = ls.t.token
             if c == "TK_NAME" then
-                self:new_localvar(ls, self:str_checkname(ls), nparams)
+                local name, type_annot = self:checkname(ls, {}, true)
+                self:new_localvar(ls, name, nparams)
+                param_types[nparams + 1] = type_annot
+                if type_annot then
+                    emit_type_check(fs, nparams, type_annot, ls.linenumber)
+                end
                 nparams = nparams + 1
             elseif c == "TK_DOTS" then
-                luaK:next(ls)
+                Lexer:next(ls)
                 self:new_localvarliteral(ls, "arg", nparams)
                 nparams = nparams + 1
                 f.is_vararg = self.VARARG_HASARG + self.VARARG_NEEDSARG
                 f.is_vararg = f.is_vararg + self.VARARG_ISVARARG
             else
-                luaK:syntaxerror(ls, "<name> or " .. self:LUA_QL("...") .. " expected")
+                Lexer:syntaxerror(ls, "<name> or " .. self:LUA_QL("...") .. " expected")
             end
         until f.is_vararg ~= 0 or not self:testnext(ls, ",")
     end
     self:adjustlocalvars(ls, nparams)
     f.numparams = fs.nactvar - (f.is_vararg % self.HASARG_MASK)
-    luaK:reserveregs(fs, fs.nactvar)
+    Codegen:reserveregs(fs, fs.nactvar)
+    return param_types
 end
-function luaY:body(ls, e, needself, line)
+function Parser:body(ls, e, needself, line)
     local new_fs = {}
     new_fs.upvalues = {}
     new_fs.actvar = {}
@@ -2302,25 +2346,41 @@ function luaY:body(ls, e, needself, line)
         self:new_localvarliteral(ls, "self", 0)
         self:adjustlocalvars(ls, 1)
     end
-    self:parlist(ls)
+    local param_types = self:parlist(ls)
     self:checknext(ls, ")")
+    if ls.t.token == ":" then
+        Lexer:next(ls)
+        self:check(ls, "TK_NAME")
+        local return_type = ls.t.seminfo
+        if not is_valid_type(return_type) then
+            Lexer:syntaxerror(ls, string.format("Invalid return type '%s'", return_type))
+        end
+        Lexer:next(ls)
+        e.return_type = return_type
+    end
     self:chunk(ls)
     new_fs.f.lastlinedefined = ls.linenumber
     self:check_match(ls, "TK_END", "TK_FUNCTION", line)
+    if e.return_type and e.return_type ~= "()" then
+        local ret_reg = new_fs.freereg
+        Codegen:reserveregs(new_fs, 1)
+        Codegen:codeABC(new_fs, "OP_RETURN", ret_reg, 2, 0)
+        emit_type_check(new_fs, ret_reg, e.return_type, ls.linenumber)
+    end
     self:close_func(ls)
     self:pushclosure(ls, new_fs, e)
 end
-function luaY:explist1(ls, v)
+function Parser:explist1(ls, v)
     local n = 1
     self:expr(ls, v)
     while self:testnext(ls, ",") do
-        luaK:exp2nextreg(ls.fs, v)
+        Codegen:exp2nextreg(ls.fs, v)
         self:expr(ls, v)
         n = n + 1
     end
     return n
 end
-function luaY:funcargs(ls, f)
+function Parser:funcargs(ls, f)
     local fs = ls.fs
     local args = {}
     local nparams
@@ -2328,23 +2388,23 @@ function luaY:funcargs(ls, f)
     local c = ls.t.token
     if c == "(" then
         if line ~= ls.lastline then
-            luaK:syntaxerror(ls, "ambiguous syntax (function call x new statement)")
+            Lexer:syntaxerror(ls, "ambiguous syntax (function call x new statement)")
         end
-        luaK:next(ls)
+        Lexer:next(ls)
         if ls.t.token == ")" then
             args.k = "VVOID"
         else
             self:explist1(ls, args)
-            luaK:setmultret(fs, args)
+            Codegen:setmultret(fs, args)
         end
         self:check_match(ls, ")", "(", line)
     elseif c == "{" then
         self:constructor(ls, args)
     elseif c == "TK_STRING" then
         self:codestring(ls, args, ls.t.seminfo)
-        luaK:next(ls)
+        Lexer:next(ls)
     else
-        luaK:syntaxerror(ls, "function arguments expected")
+        Lexer:syntaxerror(ls, "function arguments expected")
         return
     end
     local base = f.info
@@ -2352,42 +2412,42 @@ function luaY:funcargs(ls, f)
         nparams = self.LUA_MULTRET
     else
         if args.k ~= "VVOID" then
-            luaK:exp2nextreg(fs, args)
+            Codegen:exp2nextreg(fs, args)
         end
         nparams = fs.freereg - (base + 1)
     end
-    self:init_exp(f, "VCALL", luaK:codeABC(fs, "OP_CALL", base, nparams + 1, 2))
-    luaK:fixline(fs, line)
+    self:init_exp(f, "VCALL", Codegen:codeABC(fs, "OP_CALL", base, nparams + 1, 2))
+    Codegen:fixline(fs, line)
     fs.freereg = base + 1
 end
-function luaY:prefixexp(ls, v)
+function Parser:prefixexp(ls, v)
     local c = ls.t.token
     if c == "(" then
         local line = ls.linenumber
-        luaK:next(ls)
+        Lexer:next(ls)
         self:expr(ls, v)
         self:check_match(ls, ")", "(", line)
-        luaK:dischargevars(ls.fs, v)
+        Codegen:dischargevars(ls.fs, v)
     elseif c == "TK_NAME" then
         self:singlevar(ls, v)
     else
-        luaK:syntaxerror(ls, "unexpected symbol")
+        Lexer:syntaxerror(ls, "unexpected symbol")
     end
     return
 end
-function luaY:primaryexp(ls, v)
+function Parser:primaryexp(ls, v)
     local fs = ls.fs
     local c = ls.t.token
     local line = ls.linenumber
     if c == "(" then
-        luaK:next(ls)
+        Lexer:next(ls)
         self:expr(ls, v)
         self:check_match(ls, ")", "(", line)
-        luaK:dischargevars(fs, v)
+        Codegen:dischargevars(fs, v)
     elseif c == "TK_NAME" then
         self:singlevar(ls, v)
     else
-        luaK:syntaxerror(ls, string.format("unexpected symbol '%s'", luaK:token2str(ls, c)))
+        Lexer:syntaxerror(ls, string.format("unexpected symbol '%s'", Lexer:token2str(ls, c)))
     end
     while true do
         c = ls.t.token
@@ -2395,43 +2455,50 @@ function luaY:primaryexp(ls, v)
             self:field(ls, v)
         elseif c == "[" then
             local key = {}
-            luaK:exp2anyreg(fs, v)
+            Codegen:exp2anyreg(fs, v)
             self:yindex(ls, key)
-            luaK:indexed(fs, v, key)
+            Codegen:indexed(fs, v, key)
         elseif c == ":" then
             local key = {}
-            luaK:next(ls)
+            Lexer:next(ls)
             self:checkname(ls, key)
-            luaK:_self(fs, v, key)
+            Codegen:_self(fs, v, key)
             self:funcargs(ls, v)
         elseif c == "TK_DOUBLECOLON" then
-            luaK:next(ls)
+            Lexer:next(ls)
+            self:check(ls, "TK_NAME")
+            local type_assert = ls.t.seminfo
+            if not is_valid_type(type_assert) then
+                Lexer:syntaxerror(ls, string.format("Invalid type assertion '%s'", type_assert))
+            end
+            Lexer:next(ls)
+            local reg = Codegen:exp2anyreg(fs, v)
+            emit_type_check(fs, reg, type_assert, ls.linenumber)
+            v.k = "VNONRELOC"
+            v.info = reg
         elseif c == "(" or c == "TK_STRING" or c == "{" then
-            luaK:exp2nextreg(fs, v)
+            Codegen:exp2nextreg(fs, v)
             self:funcargs(ls, v)
         else
             return
         end
     end
 end
-function luaY:gotostat(ls)
+function Parser:gotostat(ls)
     local fs = ls.fs
     local label = self:str_checkname(ls)
-    local g = self:searchlabel(fs, label)
-    if g >= 0 then
-        luaK:jump(fs, g)
-    else
-        self:addpendinggoto(fs, label)
-    end
+    self:addpendinggoto(fs, label, Codegen:jump(fs))
+    fs.pendinggotos[fs.npendinggotos - 1].nactvar = fs.nactvar
 end
-function luaY:labelstat(ls, label, line)
+function Parser:labelstat(ls, label, line)
     local fs = ls.fs
     self:checkrepeated(fs, label)
-    local g = luaK:getlabel(fs)
+    local g = Codegen:getlabel(fs)
     self:addlabel(fs, label, g)
+    fs.labels[fs.nlabels - 1].nactvar = fs.nactvar
     self:checknext(ls, "TK_DOUBLECOLON")
 end
-function luaY:searchlabel(fs, label)
+function Parser:searchlabel(fs, label)
     for i = 0, fs.nlabels - 1 do
         if fs.labels[i].name == label then
             return fs.labels[i].pc
@@ -2439,17 +2506,17 @@ function luaY:searchlabel(fs, label)
     end
     return -1
 end
-function luaY:checkrepeated(fs, label)
+function Parser:checkrepeated(fs, label)
     if self:searchlabel(fs, label) >= 0 then
-        luaK:syntaxerror(fs.ls, string.format("label '%s' already defined", label))
+        Lexer:syntaxerror(fs.ls, string.format("label '%s' already defined", label))
     end
 end
-function luaY:addlabel(fs, label, pc)
+function Parser:addlabel(fs, label, pc)
     self:growvector(fs.L, fs.labels, fs.nlabels, fs.sizelabels, nil, self.MAX_INT, "too many labels")
-    fs.labels[fs.nlabels] = {name = label, pc = pc}
+    fs.labels[fs.nlabels] = {name = label, pc = pc, nactvar = fs.nactvar}
     fs.nlabels = fs.nlabels + 1
 end
-function luaY:addpendinggoto(fs, label)
+function Parser:addpendinggoto(fs, label, pc)
     self:growvector(
         fs.L,
         fs.pendinggotos,
@@ -2459,13 +2526,13 @@ function luaY:addpendinggoto(fs, label)
         self.MAX_INT,
         "too many pending gotos"
     )
-    fs.pendinggotos[fs.npendinggotos] = {label = label, pc = luaK:jump(fs)}
+    fs.pendinggotos[fs.npendinggotos] = {label = label, pc = pc}
     fs.npendinggotos = fs.npendinggotos + 1
 end
-function luaY:simpleexp(ls, v)
+function Parser:simpleexp(ls, v)
     local c = ls.t.token
     if c == "TK_NUMBER" then
-        v.f, v.t = luaK.NO_JUMP, luaK.NO_JUMP
+        v.f, v.t = Codegen.NO_JUMP, Codegen.NO_JUMP
         v.k = "VKNUM"
         v.info = 0
         v.nval = ls.t.seminfo
@@ -2473,19 +2540,19 @@ function luaY:simpleexp(ls, v)
     elseif c == "TK_STRING" then
         self:codestring(ls, v, ls.t.seminfo)
     elseif c == "TK_NIL" then
-        v.f, v.t = luaK.NO_JUMP, luaK.NO_JUMP
+        v.f, v.t = Codegen.NO_JUMP, Codegen.NO_JUMP
         v.k = "VNIL"
         v.info = 0
         v.nval = nil
         v.aux = nil
     elseif c == "TK_TRUE" then
-        v.f, v.t = luaK.NO_JUMP, luaK.NO_JUMP
+        v.f, v.t = Codegen.NO_JUMP, Codegen.NO_JUMP
         v.k = "VTRUE"
         v.info = 0
         v.nval = nil
         v.aux = nil
     elseif c == "TK_FALSE" then
-        v.f, v.t = luaK.NO_JUMP, luaK.NO_JUMP
+        v.f, v.t = Codegen.NO_JUMP, Codegen.NO_JUMP
         v.k = "VFALSE"
         v.info = 0
         v.nval = nil
@@ -2501,25 +2568,25 @@ function luaY:simpleexp(ls, v)
         if is_vararg >= self.VARARG_NEEDSARG then
             fs.f.is_vararg = is_vararg - self.VARARG_NEEDSARG
         end
-        v.f, v.t = luaK.NO_JUMP, luaK.NO_JUMP
+        v.f, v.t = Codegen.NO_JUMP, Codegen.NO_JUMP
         v.k = "VVARARG"
-        v.info = luaK:codeABC(fs, "OP_VARARG", 0, 1, 0)
+        v.info = Codegen:codeABC(fs, "OP_VARARG", 0, 1, 0)
         v.nval = nil
         v.aux = nil
     elseif c == "{" then
         self:constructor(ls, v)
         return
     elseif c == "TK_FUNCTION" then
-        luaK:next(ls)
+        Lexer:next(ls)
         self:body(ls, v, false, ls.linenumber)
         return
     else
         self:primaryexp(ls, v)
         return
     end
-    luaK:next(ls)
+    Lexer:next(ls)
 end
-luaY.getbinopr_table = {
+Parser.getbinopr_table = {
     ["+"] = {opr = "OPR_ADD", left = 6, right = 6},
     ["-"] = {opr = "OPR_SUB", left = 6, right = 6},
     ["*"] = {opr = "OPR_MUL", left = 7, right = 7},
@@ -2546,7 +2613,7 @@ luaY.getbinopr_table = {
     ["TK_FLOORDIV"] = {opr = "OPR_FLOORDIV", left = 7, right = 7},
     ["TK_FLOORDIV2"] = {opr = "OPR_FLOORDIV2", left = 7, right = 7}
 }
-function luaY:getbinopr(op)
+function Parser:getbinopr(op)
     local opr = self.getbinopr_table[op]
     if opr then
         return opr
@@ -2554,7 +2621,7 @@ function luaY:getbinopr(op)
         return "OPR_NOBINOPR"
     end
 end
-function luaY:getunopr(token)
+function Parser:getunopr(token)
     if token == "TK_NOT" then
         return "OPR_NOT"
     elseif token == "-" then
@@ -2565,33 +2632,33 @@ function luaY:getunopr(token)
         return "OPR_NOUNOPR"
     end
 end
-luaY.UNARY_PRIORITY = 8
-function luaY:subexpr(ls, v, limit)
-    luaY:enterlevel(ls)
+Parser.UNARY_PRIORITY = 8
+function Parser:subexpr(ls, v, limit)
+    Parser:enterlevel(ls)
     local token = ls.t.token
     local uop = self:getunopr(token)
     if uop ~= "OPR_NOUNOPR" then
-        luaK:next(ls)
-        luaY:subexpr(ls, v, luaY.UNARY_PRIORITY)
-        luaK:prefix(ls.fs, uop, v)
+        Lexer:next(ls)
+        Parser:subexpr(ls, v, Parser.UNARY_PRIORITY)
+        Codegen:prefix(ls.fs, uop, v)
     else
-        luaY:simpleexp(ls, v)
+        Parser:simpleexp(ls, v)
     end
-    local binop_info = luaY.getbinopr_table[ls.t.token]
+    local binop_info = Parser.getbinopr_table[ls.t.token]
     while binop_info and binop_info.left > limit do
         local op = binop_info.opr
         local v2 = {}
-        luaK:next(ls)
-        luaK:infix(ls.fs, op, v)
-        local nextop_info = luaY:subexpr(ls, v2, binop_info.right)
-        luaK:posfix(ls.fs, op, v, v2)
-        binop_info = luaY.getbinopr_table[ls.t.token]
+        Lexer:next(ls)
+        Codegen:infix(ls.fs, op, v)
+        local nextop_info = Parser:subexpr(ls, v2, binop_info.right)
+        Codegen:posfix(ls.fs, op, v, v2)
+        binop_info = Parser.getbinopr_table[ls.t.token]
     end
-    luaY:leavelevel(ls)
+    Parser:leavelevel(ls)
     return binop_info and binop_info.opr or "OPR_NOBINOPR"
 end
-function luaY:expr(ls, v)
-    v = v or {f = luaK.NO_JUMP, t = luaK.NO_JUMP}
+function Parser:expr(ls, v)
+    v = v or {f = Codegen.NO_JUMP, t = Codegen.NO_JUMP}
     if ls.t.token == "TK_IF" then
         self:ternary(ls, v)
     else
@@ -2599,21 +2666,21 @@ function luaY:expr(ls, v)
     end
     return v
 end
-function luaY:block_follow(token)
+function Parser:block_follow(token)
     if token == "TK_ELSE" or token == "TK_ELSEIF" or token == "TK_END" or token == "TK_UNTIL" or token == "TK_EOS" then
         return true
     else
         return false
     end
 end
-function luaY:block(ls)
+function Parser:block(ls)
     local fs = ls.fs
     local bl = {}
     self:enterblock(fs, bl, false)
     self:chunk(ls)
     self:leaveblock(fs)
 end
-function luaY:check_conflict(ls, lh, v)
+function Parser:check_conflict(ls, lh, v)
     local fs = ls.fs
     local extra = fs.freereg
     local conflict = false
@@ -2631,40 +2698,24 @@ function luaY:check_conflict(ls, lh, v)
         lh = lh.prev
     end
     if conflict then
-        luaK:codeABC(fs, "OP_MOVE", fs.freereg, v.info, 0)
-        luaK:reserveregs(fs, 1)
+        Codegen:codeABC(fs, "OP_MOVE", fs.freereg, v.info, 0)
+        Codegen:reserveregs(fs, 1)
     end
 end
-function luaY:assignment(ls, lh, nvars)
+function Parser:assignment(ls, lh, nvars)
     local e = {}
     local c = lh.v.k
     self:check_condition(ls, c == "VLOCAL" or c == "VUPVAL" or c == "VGLOBAL" or c == "VINDEXED", "syntax error")
+    local type_assert = nil
     if self:testnext(ls, "TK_DOUBLECOLON") then
-        if self:testnext(ls, ",") then
-            local nv = {}
-            nv.v = {}
-            nv.prev = lh
-            self:primaryexp(ls, nv.v)
-            if nv.v.k == "VLOCAL" then
-                self:check_conflict(ls, lh, nv.v)
-            end
-            self:checklimit(ls.fs, nvars, self.LUAI_MAXCCALLS - ls.L.nCcalls, "variables in assignment")
-            self:assignment(ls, nv, nvars + 1)
-        elseif ls.t.token == "=" then
-            self:checknext(ls, "=")
-            local nexps = self:explist1(ls, e)
-            if nexps ~= nvars then
-                self:adjust_assign(ls, nvars, nexps, e)
-                if nexps > nvars then
-                    ls.fs.freereg = ls.fs.freereg - (nexps - nvars)
-                end
-            else
-                luaK:setoneret(ls.fs, e)
-                luaK:storevar(ls.fs, lh.v, e)
-                return
-            end
+        self:check(ls, "TK_NAME")
+        type_assert = ls.t.seminfo
+        if not is_valid_type(type_assert) then
+            Lexer:syntaxerror(ls, string.format("Invalid type assertion '%s'", type_assert))
         end
-    elseif self:testnext(ls, ",") then
+        Lexer:next(ls)
+    end
+    if self:testnext(ls, ",") then
         local nv = {}
         nv.v = {}
         nv.prev = lh
@@ -2674,26 +2725,47 @@ function luaY:assignment(ls, lh, nvars)
         end
         self:checklimit(ls.fs, nvars, self.LUAI_MAXCCALLS - ls.L.nCcalls, "variables in assignment")
         self:assignment(ls, nv, nvars + 1)
+    elseif type_assert then
+        self:checknext(ls, "=")
+        local nexps = self:explist1(ls, e)
+        if nexps ~= nvars then
+            self:adjust_assign(ls, nvars, nexps, e)
+            if nexps > nvars then
+                ls.fs.freereg = ls.fs.freereg - (nexps - nvars)
+            end
+        else
+            Codegen:setoneret(ls.fs, e)
+            local reg = ls.fs.freereg - 1
+            emit_type_check(ls.fs, reg, type_assert, ls.linenumber)
+            Codegen:storevar(ls.fs, lh.v, e)
+            return
+        end
     else
         local op = ls.t.token
-        if
-            op == "TK_ADD2" or op == "TK_SUB2" or op == "TK_MUL2" or op == "TK_DIV2" or op == "TK_MOD2" or
-                op == "TK_POW2" or
-                op == "TK_CONCAT2" or
-                op == "TK_FLOORDIV2"
-         then
-            luaK:next(ls)
+        local binop_map = {
+            TK_ADD2 = "OPR_ADD", TK_SUB2 = "OPR_SUB", TK_MUL2 = "OPR_MUL",
+            TK_DIV2 = "OPR_DIV", TK_MOD2 = "OPR_MOD", TK_POW2 = "OPR_POW",
+            TK_CONCAT2 = "OPR_CONCAT", TK_FLOORDIV2 = "OPR_FLOORDIV",
+            ["="] = nil
+        }
+        local binop_str = binop_map[op]
+        if binop_str then
+            Lexer:next(ls)
             local v = {}
             self:expr(ls, v)
-            local binop = luaY:getbinopr(op)
-            local var = {}
-            var.k = lh.v.k
-            var.info = lh.v.info
-            var.aux = lh.v.aux
-            luaK:posfix(ls.fs, binop, lh.v, v)
-            luaK:storevar(ls.fs, var, lh.v)
-        else
-            self:checknext(ls, "=")
+            if lh.v.k == "VINDEXED" then
+                local temp = {k = lh.v.k, info = lh.v.info, aux = lh.v.aux}
+                local temp_reg = Codegen:exp2anyreg(ls.fs, temp)
+                local result = {k = "VNONRELOC", info = temp_reg}
+                Codegen:posfix(ls.fs, binop_str, result, v)
+                Codegen:storevar(ls.fs, lh.v, result)
+            else
+                Codegen:posfix(ls.fs, binop_str, lh.v, v)
+                Codegen:storevar(ls.fs, lh.v, lh.v)
+            end
+            return
+        elseif op == "=" then
+            Lexer:next(ls)
             local nexps = self:explist1(ls, e)
             if nexps ~= nvars then
                 self:adjust_assign(ls, nvars, nexps, e)
@@ -2701,25 +2773,27 @@ function luaY:assignment(ls, lh, nvars)
                     ls.fs.freereg = ls.fs.freereg - (nexps - nvars)
                 end
             else
-                luaK:setoneret(ls.fs, e)
-                luaK:storevar(ls.fs, lh.v, e)
+                Codegen:setoneret(ls.fs, e)
+                Codegen:storevar(ls.fs, lh.v, e)
                 return
             end
+        else
+            Lexer:syntaxerror(ls, "invalid assignment operator")
         end
     end
     self:init_exp(e, "VNONRELOC", ls.fs.freereg - 1)
-    luaK:storevar(ls.fs, lh.v, e)
+    Codegen:storevar(ls.fs, lh.v, e)
 end
-function luaY:cond(ls)
+function Parser:cond(ls)
     local v = {}
     self:expr(ls, v)
     if v.k == "VNIL" then
         v.k = "VFALSE"
     end
-    luaK:goiftrue(ls.fs, v)
+    Codegen:goiftrue(ls.fs, v)
     return v.f
 end
-function luaY:breakstat(ls)
+function Parser:breakstat(ls)
     local fs = ls.fs
     local bl = fs.bl
     local upval = false
@@ -2730,14 +2804,14 @@ function luaY:breakstat(ls)
         bl = bl.previous
     end
     if not bl then
-        luaK:syntaxerror(ls, "no loop to break")
+        Lexer:syntaxerror(ls, "no loop to break")
     end
     if upval then
-        luaK:codeABC(fs, "OP_CLOSE", bl.nactvar, 0, 0)
+        Codegen:codeABC(fs, "OP_CLOSE", bl.nactvar, 0, 0)
     end
-    bl.breaklist = luaK:concat(fs, bl.breaklist, luaK:jump(fs))
+    bl.breaklist = Codegen:concat(fs, bl.breaklist, Codegen:jump(fs))
 end
-function luaY:continuestat(ls)
+function Parser:continuestat(ls)
     local fs = ls.fs
     local bl = fs.bl
     local upval = false
@@ -2748,82 +2822,80 @@ function luaY:continuestat(ls)
         bl = bl.previous
     end
     if not bl then
-        luaK:syntaxerror(ls, "no loop to continue")
+        Lexer:syntaxerror(ls, "no loop to continue")
     end
     if upval then
-        luaK:codeABC(fs, "OP_CLOSE", bl.nactvar, 0, 0)
+        Codegen:codeABC(fs, "OP_CLOSE", bl.nactvar, 0, 0)
     end
-    local jump = luaK:jump(fs)
-    bl.continuelist = luaK:concat(fs, bl.continuelist, jump)
+    local jump = Codegen:jump(fs)
+    bl.continuelist = Codegen:concat(fs, bl.continuelist, jump)
 end
-function luaY:whilestat(ls, line)
+function Parser:whilestat(ls, line)
     local fs = ls.fs
     local bl = {}
-    luaK:next(ls)
-    local whileinit = luaK:getlabel(fs)
+    Lexer:next(ls)
+    local whileinit = Codegen:getlabel(fs)
     local condexit = self:cond(ls)
     self:enterblock(fs, bl, true)
     self:checknext(ls, "TK_DO")
     self:block(ls)
-    luaK:patchlist(fs, bl.continuelist, whileinit)
-    luaK:patchlist(fs, luaK:jump(fs), whileinit)
+    Codegen:patchlist(fs, bl.continuelist, whileinit)
+    Codegen:patchlist(fs, Codegen:jump(fs), whileinit)
     self:check_match(ls, "TK_END", "TK_WHILE", line)
     self:leaveblock(fs)
-    luaK:patchtohere(fs, condexit)
+    Codegen:patchtohere(fs, condexit)
 end
-function luaY:repeatstat(ls, line)
+function Parser:repeatstat(ls, line)
     local fs = ls.fs
-    local repeat_init = luaK:getlabel(fs)
+    local repeat_init = Codegen:getlabel(fs)
     local bl1, bl2 = {}, {}
     self:enterblock(fs, bl1, true)
     self:enterblock(fs, bl2, false)
-    luaK:next(ls)
+    Lexer:next(ls)
     self:chunk(ls)
     self:check_match(ls, "TK_UNTIL", "TK_REPEAT", line)
     local cond_start = fs.pc
     local condexit = self:cond(ls)
     if not bl2.upval then
         self:leaveblock(fs)
-        luaK:patchlist(fs, bl1.continuelist, cond_start)
-        luaK:patchlist(ls.fs, condexit, repeat_init)
+        Codegen:patchlist(fs, bl1.continuelist, cond_start)
+        Codegen:patchlist(ls.fs, condexit, repeat_init)
     else
         self:breakstat(ls)
-        luaK:patchlist(fs, bl1.continuelist, cond_start)
-        luaK:patchtohere(ls.fs, condexit)
+        Codegen:patchlist(fs, bl1.continuelist, cond_start)
+        Codegen:patchtohere(ls.fs, condexit)
         self:leaveblock(fs)
-        luaK:patchlist(ls.fs, luaK:jump(fs), repeat_init)
+        Codegen:patchlist(ls.fs, Codegen:jump(fs), repeat_init)
     end
     self:leaveblock(fs)
 end
-function luaY:exp1(ls)
+function Parser:exp1(ls)
     local e = {}
     self:expr(ls, e)
     local k = e.k
-    luaK:exp2nextreg(ls.fs, e)
+    Codegen:exp2nextreg(ls.fs, e)
     return k
 end
-function luaY:forbody(ls, base, line, nvars, isnum)
+function Parser:forbody(ls, base, line, nvars, isnum)
     local bl = {}
     local fs = ls.fs
     self:adjustlocalvars(ls, 3)
     self:checknext(ls, "TK_DO")
-    local prep =
-        isnum and luaK:codeAsBx(fs, "OP_FORPREP", base, luaK.NO_JUMP) or luaK:jump(fs)
+    local prep = isnum and Codegen:codeAsBx(fs, "OP_FORPREP", base, Codegen.NO_JUMP) or Codegen:jump(fs)
     self:enterblock(fs, bl, true)
     self:adjustlocalvars(ls, nvars)
-    luaK:reserveregs(fs, nvars)
+    Codegen:reserveregs(fs, nvars)
     self:block(ls)
     self:leaveblock(fs)
     local continue_target = fs.pc
-    luaK:patchtohere(fs, bl.continuelist)
-    luaK:patchtohere(fs, prep)
+    Codegen:patchtohere(fs, bl.continuelist)
+    Codegen:patchtohere(fs, prep)
     local endfor =
-        isnum and luaK:codeAsBx(fs, "OP_FORLOOP", base, luaK.NO_JUMP) or
-        luaK:codeABC(fs, "OP_TFORLOOP", base, 0, nvars)
-    luaK:fixline(fs, line)
-    luaK:patchlist(fs, isnum and endfor or luaK:jump(fs), prep + 1)
+        isnum and Codegen:codeAsBx(fs, "OP_FORLOOP", base, Codegen.NO_JUMP) or Codegen:codeABC(fs, "OP_TFORLOOP", base, 0, nvars)
+    Codegen:fixline(fs, line)
+    Codegen:patchlist(fs, isnum and endfor or Codegen:jump(fs), prep + 1)
 end
-function luaY:fornum(ls, varname, line)
+function Parser:fornum(ls, varname, line)
     local fs = ls.fs
     local base = fs.freereg
     self:new_localvarliteral(ls, "(for index)", 0)
@@ -2837,12 +2909,12 @@ function luaY:fornum(ls, varname, line)
     if self:testnext(ls, ",") then
         self:exp1(ls)
     else
-        luaK:codeABx(fs, "OP_LOADK", fs.freereg, luaK:numberK(fs, 1))
-        luaK:reserveregs(fs, 1)
+        Codegen:codeABx(fs, "OP_LOADK", fs.freereg, Codegen:numberK(fs, 1))
+        Codegen:reserveregs(fs, 1)
     end
     self:forbody(ls, base, line, 1, true)
 end
-function luaY:forlist(ls, indexname)
+function Parser:forlist(ls, indexname)
     local fs = ls.fs
     local e = {}
     local nvars = 0
@@ -2862,14 +2934,14 @@ function luaY:forlist(ls, indexname)
     self:checknext(ls, "TK_IN")
     local line = ls.linenumber
     self:adjust_assign(ls, 3, self:explist1(ls, e), e)
-    luaK:checkstack(fs, 3)
+    Codegen:checkstack(fs, 3)
     self:forbody(ls, base, line, nvars - 3, false)
 end
-function luaY:forstat(ls, line)
+function Parser:forstat(ls, line)
     local fs = ls.fs
     local bl = {}
     self:enterblock(fs, bl, true)
-    luaK:next(ls)
+    Lexer:next(ls)
     local varname = self:str_checkname(ls)
     local c = ls.t.token
     if c == "=" then
@@ -2877,104 +2949,124 @@ function luaY:forstat(ls, line)
     elseif c == "," or c == "TK_IN" then
         self:forlist(ls, varname)
     else
-        luaK:syntaxerror(ls, self:LUA_QL("=") .. " or " .. self:LUA_QL("in") .. " expected")
+        Lexer:syntaxerror(ls, self:LUA_QL("=") .. " or " .. self:LUA_QL("in") .. " expected")
     end
     self:check_match(ls, "TK_END", "TK_FOR", line)
     self:leaveblock(fs)
 end
-function luaY:test_then_block(ls)
-    luaK:next(ls)
+function Parser:test_then_block(ls)
+    Lexer:next(ls)
     local condexit = self:cond(ls)
     self:checknext(ls, "TK_THEN")
     self:block(ls)
     return condexit
 end
-function luaY:ifstat(ls, line)
+function Parser:ifstat(ls, line)
     local fs = ls.fs
-    local escapelist = luaK.NO_JUMP
+    local escapelist = Codegen.NO_JUMP
     local flist = self:test_then_block(ls)
     while ls.t.token == "TK_ELSEIF" do
-        escapelist = luaK:concat(fs, escapelist, luaK:jump(fs))
-        luaK:patchtohere(fs, flist)
+        escapelist = Codegen:concat(fs, escapelist, Codegen:jump(fs))
+        Codegen:patchtohere(fs, flist)
         flist = self:test_then_block(ls)
     end
     if ls.t.token == "TK_ELSE" then
-        escapelist = luaK:concat(fs, escapelist, luaK:jump(fs))
-        luaK:patchtohere(fs, flist)
-        luaK:next(ls)
+        escapelist = Codegen:concat(fs, escapelist, Codegen:jump(fs))
+        Codegen:patchtohere(fs, flist)
+        Lexer:next(ls)
         self:block(ls)
     else
-        escapelist = luaK:concat(fs, escapelist, flist)
+        escapelist = Codegen:concat(fs, escapelist, flist)
     end
-    luaK:patchtohere(fs, escapelist)
+    Codegen:patchtohere(fs, escapelist)
     self:check_match(ls, "TK_END", "TK_IF", line)
 end
-function luaY:localfunc(ls)
+function Parser:localfunc(ls)
     local v, b = {}, {}
     local fs = ls.fs
     self:new_localvar(ls, self:str_checkname(ls), 0)
     self:init_exp(v, "VLOCAL", fs.freereg)
-    luaK:reserveregs(fs, 1)
+    Codegen:reserveregs(fs, 1)
     self:adjustlocalvars(ls, 1)
     self:body(ls, b, false, ls.linenumber)
-    luaK:storevar(fs, v, b)
+    Codegen:storevar(fs, v, b)
     self:getlocvar(fs, fs.nactvar - 1).startpc = fs.pc
 end
-function luaY:ternary(ls, v)
+function Parser:ternary(ls, v)
     self:enterlevel(ls)
     local line = ls.linenumber
-    luaK:next(ls)
+    Lexer:next(ls)
     local cond = {}
     self:expr(ls, cond)
-    luaK:goiftrue(ls.fs, cond)
+    Codegen:goiftrue(ls.fs, cond)
     self:checknext(ls, "TK_THEN")
     local v_true = {}
     self:subexpr(ls, v_true, 0)
-    luaK:exp2nextreg(ls.fs, v_true)
+    Codegen:exp2nextreg(ls.fs, v_true)
     local result_reg = v_true.info
-    local jump_to_else = luaK:jump(ls.fs)
-    luaK:patchtohere(ls.fs, cond.f)
+    local jump_to_else = Codegen:jump(ls.fs)
+    Codegen:patchtohere(ls.fs, cond.f)
     local v_false = {}
     while ls.t.token == "TK_ELSEIF" do
-        luaK:next(ls)
+        Lexer:next(ls)
         local elseif_cond = {}
         self:expr(ls, elseif_cond)
-        luaK:goiftrue(ls.fs, elseif_cond)
+        Codegen:goiftrue(ls.fs, elseif_cond)
         self:checknext(ls, "TK_THEN")
         local elseif_val = {}
         self:subexpr(ls, elseif_val, 0)
-        luaK:exp2nextreg(ls.fs, elseif_val)
+        Codegen:exp2nextreg(ls.fs, elseif_val)
         local elseif_reg = elseif_val.info
         if elseif_reg ~= result_reg then
-            luaK:codeABC(ls.fs, "OP_MOVE", result_reg, elseif_reg, 0)
-            luaK:freereg(ls.fs, elseif_reg)
+            Codegen:codeABC(ls.fs, "OP_MOVE", result_reg, elseif_reg, 0)
+            Codegen:freereg(ls.fs, elseif_reg)
         end
-        jump_to_else = luaK:concat(ls.fs, jump_to_else, luaK:jump(ls.fs))
-        luaK:patchtohere(ls.fs, elseif_cond.f)
+        jump_to_else = Codegen:concat(ls.fs, jump_to_else, Codegen:jump(ls.fs))
+        Codegen:patchtohere(ls.fs, elseif_cond.f)
     end
     self:checknext(ls, "TK_ELSE")
     self:subexpr(ls, v_false, 0)
-    luaK:exp2nextreg(ls.fs, v_false)
+    Codegen:exp2nextreg(ls.fs, v_false)
     local false_reg = v_false.info
     if false_reg ~= result_reg then
-        luaK:codeABC(ls.fs, "OP_MOVE", result_reg, false_reg, 0)
-        luaK:freereg(ls.fs, false_reg)
+        Codegen:codeABC(ls.fs, "OP_MOVE", result_reg, false_reg, 0)
+        Codegen:freereg(ls.fs, false_reg)
     end
-    local end_jump = luaK:jump(ls.fs)
-    luaK:patchtohere(ls.fs, jump_to_else)
+    local end_jump = Codegen:jump(ls.fs)
+    Codegen:patchtohere(ls.fs, jump_to_else)
     self:init_exp(v, "VNONRELOC", result_reg)
-    v.t = luaK.NO_JUMP
-    v.f = luaK.NO_JUMP
-    luaK:patchtohere(ls.fs, end_jump)
+    v.t = Codegen.NO_JUMP
+    v.f = Codegen.NO_JUMP
+    Codegen:patchtohere(ls.fs, end_jump)
     self:leavelevel(ls)
 end
-function luaY:localstat(ls)
+function Parser:localstat(ls)
     local nvars = 0
     local nexps
     local e = {}
+    local varnames = {}
+    local types = {}
     repeat
-        local varname = self:str_checkname(ls)
-        self:new_localvar(ls, varname, nvars)
+        local varname, type_annot = self:checkname(ls, {}, true)
+        local is_const = false
+        local is_close = false
+        if ls.t.token == "<" then
+            Lexer:next(ls)
+            self:check(ls, "TK_NAME")
+            local attr = ls.t.seminfo
+            if attr == "const" then
+                is_const = true
+            elseif attr == "close" then
+                is_close = true
+            else
+                Lexer:syntaxerror(ls, "Invalid attribute '" .. attr .. "'")
+            end
+            Lexer:next(ls)
+            self:checknext(ls, ">")
+        end
+        varnames[nvars + 1] = varname
+        types[nvars + 1] = type_annot
+        self:new_localvar(ls, varname, nvars, is_const, is_close)
         nvars = nvars + 1
     until not self:testnext(ls, ",")
     if self:testnext(ls, "=") then
@@ -2983,10 +3075,30 @@ function luaY:localstat(ls)
         e.k = "VVOID"
         nexps = 0
     end
+    if ls.t.token == "TK_DOUBLECOLON" then
+        Lexer:next(ls)
+        self:check(ls, "TK_NAME")
+        local type_assert = ls.t.seminfo
+        if not is_valid_type(type_assert) then
+            Lexer:syntaxerror(ls, string.format("Invalid type assertion '%s'", type_assert))
+        end
+        Lexer:next(ls)
+        if nexps == 1 and nvars == 1 then
+            Codegen:setoneret(ls.fs, e)
+            local reg = ls.fs.freereg - 1
+            emit_type_check(ls.fs, reg, type_assert, ls.linenumber)
+        end
+    end
     self:adjust_assign(ls, nvars, nexps, e)
+    for i = 1, nvars do
+        if types[i] then
+            local reg = ls.fs.freereg - nvars + i - 1
+            emit_type_check(ls.fs, reg, types[i], ls.linenumber)
+        end
+    end
     self:adjustlocalvars(ls, nvars)
 end
-function luaY:funcname(ls, v)
+function Parser:funcname(ls, v)
     local needself = false
     self:singlevar(ls, v)
     while ls.t.token == "." do
@@ -2996,101 +3108,151 @@ function luaY:funcname(ls, v)
         needself = true
         self:field(ls, v)
     end
+    if ls.t.token == ":" then
+        Lexer:next(ls)
+        self:check(ls, "TK_NAME")
+        local return_type = ls.t.seminfo
+        if not is_valid_type(return_type) then
+            Lexer:syntaxerror(ls, string.format("Invalid return type '%s'", return_type))
+        end
+        Lexer:next(ls)
+        v.return_type = return_type
+    end
     return needself
 end
-function luaY:funcstat(ls, line)
+function Parser:funcstat(ls, line)
     local v, b = {}, {}
-    luaK:next(ls)
+    Lexer:next(ls)
     local needself = self:funcname(ls, v)
     self:body(ls, b, needself, line)
-    luaK:storevar(ls.fs, v, b)
-    luaK:fixline(ls.fs, line)
+    Codegen:storevar(ls.fs, v, b)
+    Codegen:fixline(ls.fs, line)
 end
-function luaY:exprstat(ls)
+function Parser:exprstat(ls)
     local fs = ls.fs
     local v = {}
     v.v = {}
     self:primaryexp(ls, v.v)
-    if v.v.k == "VCALL" then
-        luaP:SETARG_C(luaK:getcode(fs, v.v), 1)
+    if ls.t.token == "TK_DOUBLECOLON" then
+        Lexer:next(ls)
+        self:check(ls, "TK_NAME")
+        local type_assert = ls.t.seminfo
+        if not is_valid_type(type_assert) then
+            Lexer:syntaxerror(ls, string.format("Invalid type assertion '%s'", type_assert))
+        end
+        Lexer:next(ls)
+        local reg = Codegen:exp2anyreg(fs, v.v)
+        emit_type_check(fs, reg, type_assert, ls.linenumber)
+    elseif v.v.k == "VCALL" then
+        Instruction:SETARG_C(Codegen:getcode(fs, v.v), 1)
     else
         v.prev = nil
         self:assignment(ls, v, 1)
     end
 end
-function luaY:retstat(ls)
+function Parser:retstat(ls)
     local fs = ls.fs
     local e = {}
     local first, nret
-    luaK:next(ls)
+    Lexer:next(ls)
     if self:block_follow(ls.t.token) or ls.t.token == ";" then
         first, nret = 0, 0
     else
         nret = self:explist1(ls, e)
         if self:hasmultret(e.k) then
-            luaK:setmultret(fs, e)
+            Codegen:setmultret(fs, e)
             if e.k == "VCALL" and nret == 1 then
-                luaP:SET_OPCODE(luaK:getcode(fs, e), "OP_TAILCALL")
+                Instruction:SET_OPCODE(Codegen:getcode(fs, e), "OP_TAILCALL")
             end
             first = fs.nactvar
             nret = self.LUA_MULTRET
         else
             if nret == 1 then
-                first = luaK:exp2anyreg(fs, e)
+                first = Codegen:exp2anyreg(fs, e)
             else
-                luaK:exp2nextreg(fs, e)
+                Codegen:exp2nextreg(fs, e)
                 first = fs.nactvar
             end
         end
     end
-    luaK:ret(fs, first, nret)
+    Codegen:ret(fs, first, nret)
 end
-local statement_handlers = {
-    TK_IF = luaY.ifstat,
-    TK_WHILE = luaY.whilestat,
-    TK_DO = function(self, ls, line)
-        luaK:next(ls)
+local statement_handlers = {TK_IF = Parser.ifstat, TK_WHILE = Parser.whilestat, TK_DO = function(self, ls, line)
+        Lexer:next(ls)
         self:block(ls)
         self:check_match(ls, "TK_END", "TK_DO", line)
         return false
-    end,
-    TK_FOR = luaY.forstat,
-    TK_REPEAT = luaY.repeatstat,
-    TK_FUNCTION = luaY.funcstat,
-    TK_LOCAL = function(self, ls)
-        luaK:next(ls)
+    end, TK_FOR = Parser.forstat, TK_REPEAT = Parser.repeatstat, TK_FUNCTION = Parser.funcstat, TK_LOCAL = function(self, ls)
+        Lexer:next(ls)
         if self:testnext(ls, "TK_FUNCTION") then
             self:localfunc(ls)
         else
             self:localstat(ls)
         end
         return false
-    end,
-    TK_RETURN = luaY.retstat,
-    TK_BREAK = function(self, ls)
-        luaK:next(ls)
+    end, TK_RETURN = Parser.retstat, TK_BREAK = function(self, ls)
+        Lexer:next(ls)
         self:breakstat(ls)
         return true
-    end,
-    TK_CONTINUE = function(self, ls)
-        luaK:next(ls)
+    end, TK_CONTINUE = function(self, ls)
+        Lexer:next(ls)
         self:continuestat(ls)
         return true
-    end,
-    TK_GOTO = function(self, ls)
-        luaK:next(ls)
+    end, TK_GOTO = function(self, ls)
+        Lexer:next(ls)
         self:gotostat(ls)
         return true
-    end,
-    TK_DOUBLECOLON = function(self, ls)
-        luaK:next(ls)
+    end, TK_DOUBLECOLON = function(self, ls)
+        Lexer:next(ls)
         self:labelstat(ls, self:str_checkname(ls), ls.linenumber)
         return false
-    end
-}
-function luaY:statement(ls)
+    end}
+function Parser:statement(ls)
     local line = ls.linenumber
     local token = ls.t.token
+    if token == "TK_NAME" and ls.t.seminfo == "type" then
+        Lexer:lookahead(ls)
+        if ls.lookahead.token == "TK_NAME" then
+            Lexer:next(ls)
+            self:check(ls, "TK_NAME")
+            local type_name = ls.t.seminfo
+            Lexer:next(ls)
+            self:checknext(ls, "=")
+            if ls.t.token == "TK_NAME" then
+                local type_def = ls.t.seminfo
+                if not is_valid_type(type_def) then
+                    Lexer:syntaxerror(ls, string.format("Invalid type definition '%s'", type_def))
+                end
+                Lexer:next(ls)
+            elseif ls.t.token == "{" then
+                local fields = {}
+                Lexer:next(ls)
+                while ls.t.token ~= "}" do
+                    self:check(ls, "TK_NAME")
+                    local field_name = ls.t.seminfo
+                    Lexer:next(ls)
+                    self:checknext(ls, ":")
+                    self:check(ls, "TK_NAME")
+                    local field_type = ls.t.seminfo
+                    if not is_valid_type(field_type) then
+                        Lexer:syntaxerror(ls, string.format("Invalid field type '%s'", field_type))
+                    end
+                    fields[field_name] = field_type
+                    Lexer:next(ls)
+                    if ls.t.token == "," then
+                        Lexer:next(ls)
+                    end
+                end
+                Lexer:next(ls)
+            else
+                Lexer:syntaxerror(ls, "Invalid type definition")
+            end
+            return false
+        else
+            self:exprstat(ls)
+            return false
+        end
+    end
     local handler = statement_handlers[token]
     if handler then
         return handler(self, ls, line)
@@ -3099,155 +3261,28 @@ function luaY:statement(ls)
         return false
     end
 end
-function luaY:chunk(ls)
+function Parser:chunk(ls)
     local islast = false
-    luaY:enterlevel(ls)
-    while not islast and not luaY:block_follow(ls.t.token) do
-        islast = luaY:statement(ls)
-        if ls.t.token == ";" then
-            luaK:next(ls)
-        end
+    self:enterlevel(ls)
+    while not self:block_follow(ls.t.token) do
+        islast = self:statement(ls)
+        self:testnext(ls, ";")
         ls.fs.freereg = ls.fs.nactvar
     end
-    luaY:leavelevel(ls)
+    self:leavelevel(ls)
 end
-local opnames = {
-    [0] = "MOVE",
-    [1] = "LOADK",
-    [2] = "LOADBOOL",
-    [3] = "LOADNIL",
-    [4] = "GETUPVAL",
-    [5] = "GETGLOBAL",
-    [6] = "GETTABLE",
-    [7] = "SETGLOBAL",
-    [8] = "SETUPVAL",
-    [9] = "SETTABLE",
-    [10] = "NEWTABLE",
-    [11] = "SELF",
-    [12] = "ADD",
-    [13] = "SUB",
-    [14] = "MUL",
-    [15] = "DIV",
-    [16] = "MOD",
-    [17] = "POW",
-    [18] = "UNM",
-    [19] = "NOT",
-    [20] = "LEN",
-    [21] = "CONCAT",
-    [22] = "JMP",
-    [23] = "EQ",
-    [24] = "LT",
-    [25] = "LE",
-    [26] = "TEST",
-    [27] = "TESTSET",
-    [28] = "CALL",
-    [29] = "TAILCALL",
-    [30] = "RETURN",
-    [31] = "FORLOOP",
-    [32] = "FORPREP",
-    [33] = "TFORLOOP",
-    [34] = "SETLIST",
-    [35] = "CLOSE",
-    [36] = "CLOSURE",
-    [37] = "VARARG"
-}
-local function constToString(k)
-    if type(k.value) == "string" then
-        return '"' .. k.value .. '"'
-    else
-        return tostring(k.value)
-    end
-end
-local function printFuncHeader(func, addr)
-    local nconst = func.sizek or #func.k
-    local nloc = func.sizelocvars or #(func.locvars or {})
-    local nups = func.sizeupvalues or #(func.upvalues or {})
-    local nsubs = func.sizep or #(func.p or {})
-    local line1 = func.lineDefined or 0
-    local line2 = func.lastlinedefined or 0
-    local inscount = func.sizecode or #(func.code or {})
-    local size_in_bytes = inscount * 4
-    print(
-        string.format(
-            "main <%s:%d,%d> (%d instructions, %d bytes at %s)",
-            func.source or "?",
-            line1,
-            line2,
-            inscount,
-            size_in_bytes,
-            tostring(addr)
-        )
-    )
-    print(
-        string.format(
-            "%d%s params, %d slots, %d upvalues, %d local, %d constant, %d function",
-            func.numparams or 0,
-            (func.is_vararg and "+" or ""),
-            func.maxstacksize or 0,
-            nups,
-            nloc,
-            nconst,
-            nsubs
-        )
-    )
-end
-local function printInstruction(pc, instr, line, k)
-    local op = opnames[instr.OP or 0] or ("<OP " .. tostring(instr.OP) .. ">")
-    local a, b, c, bx = instr.A or 0, instr.B or 0, instr.C or 0, instr.Bx
-    local sBx = instr.sBx
-    io.write(string.format("\t%-4d  [%d]  %-10s", pc, line or 0, op))
-    if bx ~= nil then
-        io.write(string.format("\t%d %d", a, bx))
-        if op == "LOADK" and k and k[bx] then
-            io.write("\t; ", constToString(k[bx]))
-        end
-    elseif op == "JMP" and sBx then
-        io.write(string.format("\t%d", sBx))
-    elseif op == "SETLIST" then
-        io.write(string.format("\t%d %d %d", a, b, c))
-    else
-        io.write(string.format("\t%d %d %d", a, b, c))
-        if (op == "LOADK" or op == "GETGLOBAL" or op == "SETGLOBAL") and k and b and k[b] then
-            io.write("\t; ", constToString(k[b]))
-        end
-    end
-    io.write("\n")
-end
-local function printProto(func, addr)
-    printFuncHeader(func, addr or tostring(func))
-    for i = 1, func.sizecode or #func.code do
-        local instr = func.code[i - 1]
-        if instr then
-            local line = func.lineinfo and func.lineinfo[i - 1] or 0
-            printInstruction(i, instr, line, func.k)
-        end
-    end
-    print("")
-    if func.p then
-        for i = 1, func.sizep or #func.p do
-            local sub = func.p[i - 1]
-            if sub then
-                printProto(sub, tostring(sub))
-            end
-        end
-    end
-end
-luaK:init()
+Lexer:init()
 local LuaState = {}
-function compile(source, name, list_only)
+function compile(source, name)
     name = name or "compiled-lua"
-    local zio = luaZ:init(luaZ:make_getF(source), nil)
+    local zio = Buffer:init(source)
     if not zio then
         error("Failed to initialize input buffer")
     end
     local LuaState = {}
-    local func = luaY:parser(LuaState, zio, nil, "@" .. name)
-    if list_only then
-        printProto(func)
-        return
-    end
-    local writer, buff = luaU:make_setS()
-    local status = luaU:dump(LuaState, func, writer, buff)
+    local func = Parser:parser(LuaState, zio, nil, "@" .. name)
+    local writer, buff = Serializer:make_setS()
+    local status = Serializer:dump(LuaState, func, writer, buff)
     if status ~= 0 then
         error("Failed to serialize bytecode")
     end

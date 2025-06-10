@@ -12,6 +12,16 @@ $$$$$$$$\\$$$$$$  |\$$$$$$$\ $$  /\$$\ $$ |\$$$$$$$ |$$ |  $$ |\$$$$$$$ |
                                                                 \______/ 
 </pre>
 
+<p align="center">
+  <img src="https://img.shields.io/github/stars/nyreel/zuexiang?style=flat-square" alt="Stars" />
+  <img src="https://img.shields.io/github/forks/nyreel/zuexiang?style=flat-square" alt="Forks" />
+  <img src="https://img.shields.io/github/issues/nyreel/zuexiang?style=flat-square" alt="Issues" />
+  <img src="https://img.shields.io/github/license/nyreel/zuexiang?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/github/last-commit/nyreel/zuexiang?style=flat-square" alt="Last Commit" />
+</p>
+
+---
+
 ### ⚡ Zuexiang (ZX / ZueX / YueliangX)
 
 **Zuexiang** is a personal fork of [Yueliang](https://github.com/jnwhiteh/luajit-yueliang), a Lua 5.1 bytecode compiler.  
@@ -31,9 +41,7 @@ Still, it's fast, and the syntax extensions can be useful if you're into that.
 - Ternary expressions in `local` declarations
 - Integer division operator (`//`)
 - Still outputs standard Lua 5.1 bytecode
-- Performance is decent (see benchmark below)
-
----
+- Performance is decent
 
 ### ⚠️ Known Limitations
 
@@ -43,18 +51,6 @@ Still, it's fast, and the syntax extensions can be useful if you're into that.
 - Some identifiers are just `x`, `f`, etc. — sorry, I got lazy
 
 In short: it runs, it compiles, but don’t expect clean architecture.
-
-### 📊 Benchmark (vs Original Yueliang)
-
-Sample test input:
-
-| Metric            | Zuexiang       | Yueliang       |
-|------------------|----------------|----------------|----------------|
-| Compile Time            | ~0.29s    | ~1.92s   |
-| Bytecode Size            | 86.7 KB  | 144 KB   |
-| Sub-functions            | 229          | 229         |
-| Constants                   | 448         | 448          |
-| Instructions                | 1450       | 1419       |
 
 🧾 License
 

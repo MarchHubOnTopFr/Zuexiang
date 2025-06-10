@@ -1,6 +1,3 @@
-<p align="center">
-  <img src="https://github.com/MarchHubOnTopFr/Zuexiang/blob/main/images%20(40).jpeg?raw=true" alt="Lua Image" />
-</p>
 <pre align="center">
 $$$$$$$$\                              $$\                               
 \____$$  |                             \__|                              

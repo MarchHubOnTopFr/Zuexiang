@@ -22,7 +22,7 @@ $$$$$$$$\\$$$$$$  |\$$$$$$$\ $$  /\$$\ $$ |\$$$$$$$ |$$ |  $$ |\$$$$$$$ |
 
 ---
 
-### ⚡ Zuexiang (ZX / ZueX / YueliangX)
+### ⚡ Zuexiang (祖翔)
 
 **Zuexiang** is a personal fork of [Yueliang](http://yueliang.luaforge.net/), a Lua 5.1 bytecode compiler.  
 

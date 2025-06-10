@@ -33,15 +33,18 @@ Still, it's fast, and the syntax extensions can be useful if you're into that.
 
 ### ✨ Features (Added or Tweaked)
 
-- `continue` support
-- `goto` + labels
-- Compound assignment (`+=`, `-=`, etc.)
-- `!=` as alias for `~=`
-- Luau-style number literals (`1e3`, `0xFF`, etc.)
-- Ternary expressions in `local` declarations
-- Integer division operator (`//`)
-- Still outputs standard Lua 5.1 bytecode
-- Performance is decent
+- `continue` support  
+- `goto` + labels (behaves like standard Lua 5.2)  
+- Compound assignment (`+=`, `-=`, etc.) — now properly supports table/index expressions  
+- `!=` as alias for `~=`  
+- Luau-style number literals (`1e3`, `0xFF`, `1_000`, binary, octal, etc.)  
+- Ternary expressions in `local` declarations  
+- Integer division operator (`//`)  
+- Type annotations, type assertions, and type definitions (parser-only)  
+- Parsing support for `<const>` and `<close>` (no runtime effect)  
+- Renamed internal tools (e.g., `luak`, `luac`) for clarity  
+- Still outputs standard Lua 5.1 bytecode  
+- Performance optimizations (~0.28s compile time)
 
 ### ⚠️ Known Limitations
 

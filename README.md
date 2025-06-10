@@ -24,7 +24,7 @@ $$$$$$$$\\$$$$$$  |\$$$$$$$\ $$  /\$$\ $$ |\$$$$$$$ |$$ |  $$ |\$$$$$$$ |
 
 ### ⚡ Zuexiang (ZX / ZueX / YueliangX)
 
-**Zuexiang** is a personal fork of [Yueliang](https://github.com/jnwhiteh/luajit-yueliang), a Lua 5.1 bytecode compiler.  
+**Zuexiang** is a personal fork of [Yueliang](http://yueliang.luaforge.net/), a Lua 5.1 bytecode compiler.  
 
 This is not a production-grade compiler — more like a fun playground that sometimes works well and sometimes explodes.  
 Still, it's fast, and the syntax extensions can be useful if you're into that.

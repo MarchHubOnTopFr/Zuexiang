@@ -1,6 +1,6 @@
-![zuexiang-logo](https://github.com/MarchHubOnTopFr/Zuexiang/blob/main/images%20(40).jpeg?raw=true)
-
-
+<p align="center">
+  ![zuexiang-logo](https://github.com/MarchHubOnTopFr/Zuexiang/blob/main/images%20(40).jpeg?raw=true)
+</p>
 <pre align="center">
 $$$$$$$$\                              $$\                               
 \____$$  |                             \__|                              

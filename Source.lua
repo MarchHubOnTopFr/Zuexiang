@@ -1,5 +1,5 @@
 --[[
-  Zuexiang (ZX / ZueX / YueliangX)
+  Zuexiang (祖翔)
   A fork of the Yueliang Lua 5.1 compiler, with extended features and optimizations.
 
   Original base project:

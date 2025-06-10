@@ -60,7 +60,6 @@ Original base: Yueliang, also MIT.
 👾 About
 
 Made by Nyreel
-Alias: ZueX, ZX, YueliangX
 
 > Built fast, not clean. Shared just in case someone finds it useful.
 

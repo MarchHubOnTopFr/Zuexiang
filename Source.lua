@@ -34,17 +34,17 @@ local Buffer, Parser, Lexer, Serializer, Codegen = {}, {}, {}, {}, {}
 function Buffer:init(source)
     local pos, buffer = 1, ""
     return {reader = function()
-        if pos > #source and #buffer == 0 then
-            return nil
-        end
-        if #buffer == 0 then
-            buffer = source:sub(pos, pos + 4095)
-            pos = pos + #buffer
-        end
-        local c = buffer:sub(1, 1)
-        buffer = buffer:sub(2)
-        return c
-    end, data = "", name = "", n = 0, p = 0}
+            if pos > #source and #buffer == 0 then
+                return nil
+            end
+            if #buffer == 0 then
+                buffer = source:sub(pos, pos + 4095)
+                pos = pos + #buffer
+            end
+            local c = buffer:sub(1, 1)
+            buffer = buffer:sub(2)
+            return c
+        end, data = "", name = "", n = 0, p = 0}
 end
 function Buffer:fill(z)
     z.data = z.reader() or ""
@@ -93,6 +93,7 @@ Lexer.RESERVED =
     TK_FLOORDIV //
     TK_FLOORDIV2 //=
     TK_DOUBLECOLON ::
+    TK_VAL --disabledval
     TK_NAME <name>
     TK_NUMBER <number>
     TK_STRING <string>
@@ -124,7 +125,8 @@ function Lexer:token2str(token)
 end
 function Lexer:lexerror(ls, msg, token)
     local txtToken =
-        (token == "TK_NAME" or token == "TK_STRING" or token == "TK_NUMBER") and ls.buff or self:token2str(token) or "<unknown>"
+        (token == "TK_NAME" or token == "TK_STRING" or token == "TK_NUMBER") and ls.buff or self:token2str(token) or
+        "<unknown>"
     local line, context = ls.linenumber, ls.buff or ls.current or "<unknown>"
     error(
         ("%s:%d: %s (near '%s')%s"):format(
@@ -578,17 +580,17 @@ function Lexer:llex(ls, Token)
             elseif string.find(c, "%d") then
                 self:read_numeral(ls, Token)
                 return "TK_NUMBER"
-elseif string.find(c, "[_%a]") then
-    repeat
-        c = self:save_and_next(ls)
-    until c == "EOZ" or not string.find(c, "[_%w]")
-    local ts = ls.buff
-    local tok = self.enums[ts]
-    if tok then
-        return tok
-    end
-    Token.seminfo = ts
-    return "TK_NAME"
+            elseif string.find(c, "[_%a]") then
+                repeat
+                    c = self:save_and_next(ls)
+                until c == "EOZ" or not string.find(c, "[_%w]")
+                local ts = ls.buff
+                local tok = self.enums[ts]
+                if tok then
+                    return tok
+                end
+                Token.seminfo = ts
+                return "TK_NAME"
             else
                 self:nextc(ls)
                 return c
@@ -1951,9 +1953,17 @@ end
 local function emit_type_check(fs, reg, expected_type, line)
 end
 function Parser:checkname(ls, e, allow_type)
-    self:check(ls, "TK_NAME")
-    local name = ls.t.seminfo
-    Lexer:next(ls)
+    local token = ls.t.token
+    local name
+    if token == "TK_NAME" then
+        name = ls.t.seminfo
+        Lexer:next(ls)
+    elseif token == "TK_CONTINUE" or token == "TK_VAL" or token == "TK_GOTO" then
+        name = Lexer.tokens[token]
+        Lexer:next(ls)
+    else
+        self:error_expected(ls, "TK_NAME")
+    end
     local type_annot = nil
     if allow_type and ls.t.token == ":" then
         Lexer:next(ls)
@@ -2202,7 +2212,17 @@ function Parser:field(ls, v)
     local key = {}
     Codegen:exp2anyreg(fs, v)
     Lexer:next(ls)
-    self:checkname(ls, key)
+    local token = ls.t.token
+    if token == "TK_NAME" then
+        key.seminfo = ls.t.seminfo
+        Lexer:next(ls)
+    elseif Lexer.tokens[token] and type(Lexer.tokens[token]) == "string" then
+        key.seminfo = Lexer.tokens[token]
+        Lexer:next(ls)
+    else
+        Lexer:syntaxerror(ls, "field name expected")
+    end
+    self:codestring(ls, key, key.seminfo)
     Codegen:indexed(fs, v, key)
 end
 function Parser:yindex(ls, v)
@@ -2216,10 +2236,26 @@ function Parser:recfield(ls, cc)
     local reg = ls.fs.freereg
     local key, val = {}, {}
     local type_annot = nil
-    if ls.t.token == "TK_NAME" then
+    if ls.t.token == "TK_NAME" or (Lexer.tokens[ls.t.token] and type(Lexer.tokens[ls.t.token]) == "string") then
         self:checklimit(fs, cc.nh, self.MAX_INT, "items in a constructor")
         local name
-        name, type_annot = self:checkname(ls, key, true)
+        if ls.t.token == "TK_NAME" then
+            name = ls.t.seminfo
+            Lexer:next(ls)
+        else
+            name = Lexer.tokens[ls.t.token]
+            Lexer:next(ls)
+        end
+        if ls.t.token == ":" then
+            Lexer:next(ls)
+            self:check(ls, "TK_NAME")
+            type_annot = ls.t.seminfo
+            if not is_valid_type(type_annot) then
+                Lexer:syntaxerror(ls, string.format("Invalid type annotation '%s'", type_annot))
+            end
+            Lexer:next(ls)
+        end
+        self:codestring(ls, key, name)
     else
         self:yindex(ls, key)
     end
@@ -2486,17 +2522,32 @@ function Parser:primaryexp(ls, v)
 end
 function Parser:gotostat(ls)
     local fs = ls.fs
-    local label = self:str_checkname(ls)
+    local label = self:getlabelname(ls)
     self:addpendinggoto(fs, label, Codegen:jump(fs))
     fs.pendinggotos[fs.npendinggotos - 1].nactvar = fs.nactvar
 end
-function Parser:labelstat(ls, label, line)
+function Parser:labelstat(ls, line)
+    local label = self:getlabelname(ls)
     local fs = ls.fs
     self:checkrepeated(fs, label)
     local g = Codegen:getlabel(fs)
     self:addlabel(fs, label, g)
     fs.labels[fs.nlabels - 1].nactvar = fs.nactvar
     self:checknext(ls, "TK_DOUBLECOLON")
+end
+function Parser:getlabelname(ls)
+    local token = ls.t.token
+    if token == "TK_NAME" then
+        local name = ls.t.seminfo
+        Lexer:next(ls)
+        return name
+    elseif Lexer.tokens[token] and type(Lexer.tokens[token]) == "string" and #Lexer.tokens[token] > 1 then
+        local name = Lexer.tokens[token]
+        Lexer:next(ls)
+        return name
+    else
+        Lexer:syntaxerror(ls, "label name expected")
+    end
 end
 function Parser:searchlabel(fs, label)
     for i = 0, fs.nlabels - 1 do
@@ -2743,9 +2794,14 @@ function Parser:assignment(ls, lh, nvars)
     else
         local op = ls.t.token
         local binop_map = {
-            TK_ADD2 = "OPR_ADD", TK_SUB2 = "OPR_SUB", TK_MUL2 = "OPR_MUL",
-            TK_DIV2 = "OPR_DIV", TK_MOD2 = "OPR_MOD", TK_POW2 = "OPR_POW",
-            TK_CONCAT2 = "OPR_CONCAT", TK_FLOORDIV2 = "OPR_FLOORDIV",
+            TK_ADD2 = "OPR_ADD",
+            TK_SUB2 = "OPR_SUB",
+            TK_MUL2 = "OPR_MUL",
+            TK_DIV2 = "OPR_DIV",
+            TK_MOD2 = "OPR_MOD",
+            TK_POW2 = "OPR_POW",
+            TK_CONCAT2 = "OPR_CONCAT",
+            TK_FLOORDIV2 = "OPR_FLOORDIV",
             ["="] = nil
         }
         local binop_str = binop_map[op]
@@ -2869,6 +2925,34 @@ function Parser:repeatstat(ls, line)
     end
     self:leaveblock(fs)
 end
+function Parser:valstat(ls)
+    local nvars = 0
+    local nexps
+    local e = {}
+    local varnames = {}
+    local types = {}
+    repeat
+        local varname, type_annot = self:checkname(ls, {}, true)
+        varnames[nvars + 1] = varname
+        types[nvars + 1] = type_annot
+        self:new_localvar(ls, varname, nvars, true, false)
+        nvars = nvars + 1
+    until not self:testnext(ls, ",")
+    if self:testnext(ls, "=") then
+        nexps = self:explist1(ls, e)
+    else
+        e.k = "VVOID"
+        nexps = 0
+    end
+    self:adjust_assign(ls, nvars, nexps, e)
+    for i = 1, nvars do
+        if types[i] then
+            local reg = ls.fs.freereg - nvars + i - 1
+            emit_type_check(ls.fs, reg, types[i], ls.linenumber)
+        end
+    end
+    self:adjustlocalvars(ls, nvars)
+end
 function Parser:exp1(ls)
     local e = {}
     self:expr(ls, e)
@@ -2891,7 +2975,8 @@ function Parser:forbody(ls, base, line, nvars, isnum)
     Codegen:patchtohere(fs, bl.continuelist)
     Codegen:patchtohere(fs, prep)
     local endfor =
-        isnum and Codegen:codeAsBx(fs, "OP_FORLOOP", base, Codegen.NO_JUMP) or Codegen:codeABC(fs, "OP_TFORLOOP", base, 0, nvars)
+        isnum and Codegen:codeAsBx(fs, "OP_FORLOOP", base, Codegen.NO_JUMP) or
+        Codegen:codeABC(fs, "OP_TFORLOOP", base, 0, nvars)
     Codegen:fixline(fs, line)
     Codegen:patchlist(fs, isnum and endfor or Codegen:jump(fs), prep + 1)
 end
@@ -3177,12 +3262,19 @@ function Parser:retstat(ls)
     end
     Codegen:ret(fs, first, nret)
 end
-local statement_handlers = {TK_IF = Parser.ifstat, TK_WHILE = Parser.whilestat, TK_DO = function(self, ls, line)
+local statement_handlers = {
+    TK_IF = Parser.ifstat,
+    TK_WHILE = Parser.whilestat,
+    TK_DO = function(self, ls, line)
         Lexer:next(ls)
         self:block(ls)
         self:check_match(ls, "TK_END", "TK_DO", line)
         return false
-    end, TK_FOR = Parser.forstat, TK_REPEAT = Parser.repeatstat, TK_FUNCTION = Parser.funcstat, TK_LOCAL = function(self, ls)
+    end,
+    TK_FOR = Parser.forstat,
+    TK_REPEAT = Parser.repeatstat,
+    TK_FUNCTION = Parser.funcstat,
+    TK_LOCAL = function(self, ls)
         Lexer:next(ls)
         if self:testnext(ls, "TK_FUNCTION") then
             self:localfunc(ls)
@@ -3190,23 +3282,34 @@ local statement_handlers = {TK_IF = Parser.ifstat, TK_WHILE = Parser.whilestat, 
             self:localstat(ls)
         end
         return false
-    end, TK_RETURN = Parser.retstat, TK_BREAK = function(self, ls)
+    end,
+    TK_VAL = function(self, ls)
+        Lexer:next(ls)
+        self:valstat(ls)
+        return false
+    end,
+    TK_RETURN = Parser.retstat,
+    TK_BREAK = function(self, ls)
         Lexer:next(ls)
         self:breakstat(ls)
         return true
-    end, TK_CONTINUE = function(self, ls)
+    end,
+    TK_CONTINUE = function(self, ls)
         Lexer:next(ls)
         self:continuestat(ls)
         return true
-    end, TK_GOTO = function(self, ls)
+    end,
+    TK_GOTO = function(self, ls)
         Lexer:next(ls)
         self:gotostat(ls)
         return true
-    end, TK_DOUBLECOLON = function(self, ls)
+    end,
+    TK_DOUBLECOLON = function(self, ls)
         Lexer:next(ls)
         self:labelstat(ls, self:str_checkname(ls), ls.linenumber)
         return false
-    end}
+    end
+}
 function Parser:statement(ls)
     local line = ls.linenumber
     local token = ls.t.token

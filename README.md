@@ -44,14 +44,10 @@ Still, it's fast, and the syntax extensions can be useful if you're into that.
 - Parsing support for `<const>` and `<close>` (no runtime effect)  
 - Renamed internal tools (e.g., `luak`, `luac`) for clarity  
 - Still outputs standard Lua 5.1 bytecode  
-- Performance optimizations (~0.28s compile time)
-
 ### ⚠️ Known Limitations
 
-- Comments are stripped (not supported in parsing stage)
 - The codebase is messy — I wrote most of it in bursts
 - Not very optimized (instruction count and compiler size)
-- Some identifiers are just `x`, `f`, etc. — sorry, I got lazy
 
 In short: it runs, it compiles, but don’t expect clean architecture.
 

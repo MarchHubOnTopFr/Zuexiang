@@ -1,35 +1,3 @@
---[[
-  Zuexiang (祖翔)
-  A fork of the Yueliang Lua 5.1 compiler, with extended features and optimizations.
-
-  Original base project:
-    Yueliang - Lua 5.1 Bytecode Compiler
-    Author: Kein-Hong Man
-    Source: http://yueliang.luaforge.net/
-
-  Modifications and extensions by:
-    Nyreel
-
-  This version includes:
-    - Support for 'goto' and 'continue'
-    - Compound assignment (+=, -=, etc.) with proper table/index handling
-    - '!=' alias for '~='
-    - Luau-style number literals (binary, octal, hex, 1_000, 1e3, etc.)
-    - Ternary expressions in local declarations
-    - Integer division operator (//)
-    - Type annotation, type assertion, and type definitions (parser-only)
-    - Parsing support for <const> and <close> variable qualifiers
-    - Renamed local names for better readability
-    - Parser and performance improvements
-
-  License:
-    MIT License (same as original Yueliang)
-
-  Note:
-    This is not an official continuation of Yueliang. It’s a personal project made
-    for experimentation, learning, and fun. Expect messy code and fast hacks.
-]]
-
 local Buffer, Parser, Lexer, Serializer, Codegen = {}, {}, {}, {}, {}
 local typed = false;
 function Buffer:init(source)
@@ -507,7 +475,7 @@ function Lexer:llex(ls, Token)
 					return "TK_DOTS"
 				elseif c == "=" then
 					self:nextc(ls)
-					return "TK_CONCAT_ASSIGN"
+					return "TK_CONCAT2"
 				else
 					ls.buff = ".."
 					ls.current = c;
@@ -1694,6 +1662,13 @@ function Codegen:codearith(fs, op, e1, e2)
 			self:code_floor(fs, div_reg, div_reg)
 			e1.k = "VNONRELOC"
 			e1.info = div_reg
+		elseif op == "OP_CONCAT" then
+			local o1 = self:exp2anyreg(fs, e1)
+			local o2 = self:exp2anyreg(fs, e2)
+			self:freeexp(fs, e2)
+			self:freeexp(fs, e1)
+			e1.info = self:codeABC(fs, "OP_CONCAT", 0, o1, o2)
+			e1.k = "VRELOCABLE"
 		else
 			local o2 = (op ~= "OP_UNM" and op ~= "OP_LEN") and self:exp2RK(fs, e2) or 0;
 			local o1 = self:exp2RK(fs, e1)
@@ -1965,7 +1940,7 @@ function Parser:check_condition(ls, c, msg)
 end;
 function Parser:check_match(ls, what, who, where)
 	if not self:testnext(ls, what) then
-		Lexer:syntaxerror(ls, where == ls.linenumber and self.LUA_QS:format(Lexer:token2str(ls, what)) .. " expected" or self.LUA_QS:format(Lexer:token2str(ls, what)) .. " expected (to close " .. self.LUA_QS:format(Lexer:token2str(ls, who)) .. " at line %d)", where)
+		Lexer:syntaxerror(ls, where == ls.linenumber and ("'%s'"):format(Lexer:token2str(ls, what)) .. " expected" or ("'%s'"):format(Lexer:token2str(ls, what)) .. " expected (to close " .. ("'%s'"):format(Lexer:token2str(ls, who)) .. " at line %d)", where)
 	end
 end;
 function Parser:parse_type(ls)
@@ -1989,20 +1964,47 @@ function Parser:parse_type(ls)
 		end;
 		return lhs
 	end;
-	local function parse_generics(base)
+	local function parse_generic_args()
 		Lexer:next(ls)
 		local args = {}
-		repeat
-			local param = self:parse_type(ls)
+		while true do
+			if ls.t.token ~= "TK_NAME" then
+				Lexer:syntaxerror(ls, "Expected generic parameter name")
+			end;
+			local paramName = ls.t.seminfo;
+			Lexer:next(ls)
+			local constraint = nil;
+			local default = nil;
+			if ls.t.token == ":" then
+				Lexer:next(ls)
+				constraint = self:parse_type(ls)
+			end;
+			if ls.t.token == "=" then
+				Lexer:next(ls)
+				default = self:parse_type(ls)
+			end;
+			local param = paramName;
+			if constraint then
+				param = param .. ":" .. constraint
+			end;
+			if default then
+				param = param .. "=" .. default
+			end;
 			table.insert(args, param)
 			if ls.t.token == "," then
 				Lexer:next(ls)
 			else
 				break
 			end
-		until ls.t.token == ">"
+		end;
 		self:checknext(ls, ">")
-		return base .. "<" .. table.concat(args, ",") .. ">"
+		return "<" .. table.concat(args, ",") .. ">"
+	end;
+	local function parse_generics(base)
+		while ls.t.token == "<" do
+			base = base .. parse_generic_args()
+		end;
+		return base
 	end;
 	local function parse_indexed_access(base)
 		while ls.t.token == "[" do
@@ -2024,58 +2026,17 @@ function Parser:parse_type(ls)
 		self:checknext(ls, "TK_NAME")
 		self:checknext(ls, "in")
 		local is_keyof = false;
-		local in_expr = ""
 		if ls.t.token == "TK_NAME" and ls.t.seminfo == "keyof" then
-			is_keyof = true;
 			Lexer:next(ls)
+			is_keyof = true
 		end;
-		in_expr = self:parse_type(ls)
+		local in_expr = self:parse_type(ls)
 		self:checknext(ls, "]")
 		self:checknext(ls, ":")
 		local value = self:parse_type(ls)
-		self:checknext(ls, "}")
 		local prefix = readonly and "readonly " or ""
 		local keyof = is_keyof and "keyof " or ""
 		return "{" .. prefix .. "[" .. key .. " in " .. keyof .. in_expr .. "]:" .. value .. "}"
-	end;
-	local function parse_record()
-		local fields = {}
-		repeat
-			if (ls.t.token == "TK_NAME" and ls.t.seminfo == "readonly") or (ls.t.token == "[" and ls.lookahead.token == "TK_NAME") then
-				table.insert(fields, parse_mapped())
-				break
-			elseif ls.t.token == "TK_NAME" then
-				local name = ls.t.seminfo;
-				Lexer:next(ls)
-				local optional = false;
-				if ls.t.token == "?" then
-					Lexer:next(ls)
-					optional = true
-				end;
-				self:checknext(ls, ":")
-				local t = self:parse_type(ls)
-				table.insert(fields, name .. (optional and "?:" or ":") .. t)
-			elseif ls.t.token == "[" then
-				table.insert(fields, self:parse_type(ls))
-				break
-			else
-				break
-			end;
-			if ls.t.token == "," then
-				Lexer:next(ls)
-			end
-		until ls.t.token == "}"
-		self:checknext(ls, "}")
-		return "{" .. table.concat(fields, ",") .. "}"
-	end;
-	local function parse_map()
-		Lexer:next(ls)
-		local key = self:parse_type(ls)
-		self:checknext(ls, "]")
-		self:checknext(ls, ":")
-		local val = self:parse_type(ls)
-		self:checknext(ls, "}")
-		return "{[" .. key .. "]:" .. val .. "}"
 	end;
 	local function parse_tuple()
 		Lexer:next(ls)
@@ -2091,54 +2052,38 @@ function Parser:parse_type(ls)
 		self:checknext(ls, "]")
 		return "[" .. table.concat(items, ",") .. "]"
 	end;
-	local function parse_param()
-		if ls.t.token == "TK_NAME" then
-			local name = ls.t.seminfo;
-			Lexer:next(ls)
-			if ls.t.token == ":" then
-				Lexer:next(ls)
-				local type_annotation = self:parse_type(ls)
-				return name .. ":" .. type_annotation
-			else
-				return name
-			end
-		else
-			return self:parse_type(ls)
-		end
-	end;
 	local function parse_function_type()
 		local generics = ""
 		if ls.t.token == "<" then
-			Lexer:next(ls)
-			local gparams = {}
-			repeat
-				local name = ls.t.seminfo;
-				self:checknext(ls, "TK_NAME")
-				local param = name;
-				if ls.t.token == ":" then
-					Lexer:next(ls)
-					local constraint = self:parse_type(ls)
-					param = param .. ":" .. constraint
-				end;
-				if ls.t.token == "=" then
-					Lexer:next(ls)
-					local default = self:parse_type(ls)
-					param = param .. "=" .. default
-				end;
-				table.insert(gparams, param)
-				if ls.t.token == "," then
-					Lexer:next(ls)
-				else
-					break
-				end
-			until ls.t.token == ">"
-			self:checknext(ls, ">")
-			generics = "<" .. table.concat(gparams, ",") .. ">"
+			generics = parse_generic_args()
 		end;
 		self:checknext(ls, "(")
 		local params = {}
 		while ls.t.token ~= ")" do
-			table.insert(params, parse_param())
+			local param = ""
+			if ls.t.token == "TK_NAME" then
+				local name = ls.t.seminfo;
+				Lexer:next(ls)
+				if ls.t.token == ":" then
+					Lexer:next(ls)
+					local typ = self:parse_type(ls)
+					param = name .. ":" .. typ
+				elseif ls.t.token == "?" then
+					Lexer:next(ls)
+					if ls.t.token == ":" then
+						Lexer:next(ls)
+						local typ = self:parse_type(ls)
+						param = name .. "?:" .. typ
+					else
+						param = name .. "?"
+					end
+				else
+					param = name
+				end
+			else
+				param = self:parse_type(ls)
+			end;
+			table.insert(params, param)
 			if ls.t.token == "," then
 				Lexer:next(ls)
 			else
@@ -2153,64 +2098,71 @@ function Parser:parse_type(ls)
 		end;
 		return generics .. "(" .. table.concat(params, ",") .. ")" .. ret
 	end;
-	local function parse_variadic()
-		Lexer:next(ls)
-		if ls.t.token == ":" then
-			Lexer:next(ls)
-			return "..." .. self:parse_type(ls)
-		end;
-		return "..."
-	end;
-	local function parse_literal()
-		local lit = tostring(ls.t.seminfo)
-		Lexer:next(ls)
-		return lit
-	end;
 	local function parse_prefix()
 		if ls.t.token == "TK_NAME" then
 			local id = ls.t.seminfo;
 			Lexer:next(ls)
 			local base = id;
-			while true do
-				if ls.t.token == "<" then
-					base = parse_generics(base)
+			base = parse_generics(base)
+			base = parse_indexed_access(base)
+			return base
+		elseif ls.t.token == "TK_STRING" or ls.t.token == "TK_NUMBER" or ls.t.token == "TK_TRUE" or ls.t.token == "TK_FALSE" or ls.t.token == "TK_NIL" then
+			local lit = tostring(ls.t.seminfo)
+			Lexer:next(ls)
+			return lit
+		elseif ls.t.token == "{" then
+			local fields = {}
+			Lexer:next(ls)
+			repeat
+				if (ls.t.token == "TK_NAME" and ls.t.seminfo == "readonly") or (ls.t.token == "[" and ls.lookahead.token == "TK_NAME") then
+					table.insert(fields, parse_mapped())
 				elseif ls.t.token == "[" then
-					base = parse_indexed_access(base)
+					Lexer:next(ls)
+					local key = self:parse_type(ls)
+					self:checknext(ls, "]")
+					self:checknext(ls, ":")
+					local val = self:parse_type(ls)
+					table.insert(fields, "[" .. key .. "]:" .. val)
+				elseif ls.t.token == "TK_NAME" then
+					local name = ls.t.seminfo;
+					Lexer:next(ls)
+					local optional = false;
+					if ls.t.token == "?" then
+						Lexer:next(ls)
+						optional = true
+					end;
+					self:checknext(ls, ":")
+					local val = self:parse_type(ls)
+					table.insert(fields, name .. (optional and "?:" or ":") .. val)
+				else
+					break
+				end;
+				if ls.t.token == "," then
+					Lexer:next(ls)
 				else
 					break
 				end
-			end;
-			return base
-		elseif ls.t.token == "TK_NIL" then
-			Lexer:next(ls)
-			return "nil"
-		elseif ls.t.token == "TK_STRING" or ls.t.token == "TK_NUMBER" or ls.t.token == "TK_TRUE" or ls.t.token == "TK_FALSE" then
-			return parse_literal()
-		elseif ls.t.token == "{" then
-			Lexer:next(ls)
-			if ls.t.token == "[" or ls.t.token == "TK_NAME" or ls.t.token == "}" then
-				return parse_record()
-			else
-				local types = {}
-				while ls.t.token ~= "}" do
-					table.insert(types, self:parse_type(ls))
-					if ls.t.token == "," then
-						Lexer:next(ls)
-					else
-						break
-					end
-				end;
-				self:checknext(ls, "}")
-				return "{" .. table.concat(types, ",") .. "}"
-			end
+			until ls.t.token == "}"
+			self:checknext(ls, "}")
+			return "{" .. table.concat(fields, ",") .. "}"
 		elseif ls.t.token == "[" then
 			return parse_tuple()
 		elseif ls.t.token == "(" or ls.t.token == "<" then
 			return parse_function_type()
 		elseif ls.t.token == "TK_DOTS" then
-			return parse_variadic()
+			Lexer:next(ls)
+			if ls.t.token == ":" then
+				Lexer:next(ls)
+				return "..." .. self:parse_type(ls)
+			end;
+			return "..."
 		elseif ls.t.token == "|" or ls.t.token == "&" then
 			return ""
+		elseif ls.t.token == "(" then
+			Lexer:next(ls)
+			local inner = self:parse_type(ls)
+			self:checknext(ls, ")")
+			return "(" .. inner .. ")"
 		else
 			Lexer:syntaxerror(ls, "Invalid type expression")
 		end
@@ -2925,12 +2877,7 @@ function Parser:primaryexp(ls, v)
 			self:funcargs(ls, v)
 		elseif c == "TK_DOUBLECOLON" then
 			Lexer:next(ls)
-			self:check(ls, "TK_NAME")
-			local type_assert = ls.t.seminfo;
-			if not is_valid_type(type_assert) then
-				Lexer:syntaxerror(ls, string.format("Invalid type assertion '%s'", type_assert))
-			end;
-			Lexer:next(ls)
+			local type_assert = self:parse_type(ls)
 			local reg = Codegen:exp2anyreg(fs, v)
 			emit_type_check(fs, reg, type_assert, ls.linenumber)
 			v.k = "VNONRELOC"
@@ -2997,6 +2944,53 @@ function Parser:addpendinggoto(fs, label, pc, line)
 		nactvar = fs.nactvar
 	}
 	fs.npendinggotos = fs.npendinggotos + 1
+end;
+function Parser:parse_arrow_paramlist(ls)
+	if ls.t.token ~= '(' then
+		return nil
+	end;
+	local params = {}
+	Lexer:next(ls)
+	while ls.t.token ~= ')' do
+		if ls.t.token == 'TK_NAME' then
+			local name = ls.t.seminfo;
+			Lexer:next(ls)
+			local type_annot = nil;
+			if ls.t.token == ':' then
+				Lexer:next(ls)
+				type_annot = self:parse_type(ls)
+			end;
+			table.insert(params, {
+				name = name,
+				type = type_annot
+			})
+		elseif ls.t.token == 'TK_DOTS' then
+			Lexer:next(ls)
+			local vararg_type = nil;
+			if ls.t.token == ':' then
+				Lexer:next(ls)
+				vararg_type = self:parse_type(ls)
+			end;
+			table.insert(params, {
+				vararg = true,
+				type = vararg_type
+			})
+			break
+		else
+			return nil
+		end;
+		if ls.t.token == ',' then
+			Lexer:next(ls)
+		else
+			break
+		end
+	end;
+	if ls.t.token == ')' then
+		Lexer:next(ls)
+		return params
+	else
+		return nil
+	end
 end;
 function Parser:simpleexp(ls, v)
 	local c = ls.t.token;
@@ -3219,6 +3213,27 @@ function Parser:subexpr(ls, v, limit)
 		Codegen:posfix(ls.fs, op, v, v2)
 		binop_info = Parser.getbinopr_table[ls.t.token]
 	end;
+	if ls.t.token == "TK_QUESTION" then
+		Lexer:next(ls)
+		local true_exp = {}
+		self:subexpr(ls, true_exp, 0)
+		self:checknext(ls, ":")
+		local false_exp = {}
+		self:subexpr(ls, false_exp, 0)
+		local fs = ls.fs;
+		Codegen:goiftrue(fs, v)
+		Codegen:exp2nextreg(fs, true_exp)
+		local result_reg = fs.freereg - 1;
+		local skip_true_jump = Codegen:jump(fs)
+		Codegen:patchtohere(fs, v.f)
+		Codegen:exp2nextreg(fs, false_exp)
+		if fs.freereg - 1 ~= result_reg then
+			Codegen:codeABC(fs, "OP_MOVE", result_reg, fs.freereg - 1, 0)
+			Codegen:freereg(fs, fs.freereg - 1)
+		end;
+		Codegen:patchtohere(fs, skip_true_jump)
+		self:init_exp(v, "VNONRELOC", result_reg)
+	end;
 	Parser:leavelevel(ls)
 	return binop_info and binop_info.opr or "OPR_NOBINOPR"
 end;
@@ -3340,8 +3355,12 @@ function Parser:assignment(ls, lh, nvars)
 				Codegen:posfix(ls.fs, binop_str, result, v)
 				Codegen:storevar(ls.fs, lh.v, result)
 			else
+				local original_var = {
+					k = lh.v.k,
+					info = lh.v.info
+				}
 				Codegen:posfix(ls.fs, binop_str, lh.v, v)
-				Codegen:storevar(ls.fs, lh.v, lh.v)
+				Codegen:storevar(ls.fs, original_var, lh.v)
 			end;
 			return
 		elseif op == "=" then
@@ -3474,21 +3493,25 @@ function Parser:forbody(ls, base, line, nvars, isnum)
 	Codegen:fixline(fs, line)
 	Codegen:patchlist(fs, isnum and endfor or Codegen:jump(fs), prep + 1)
 end;
-function Parser:fornum(ls, varname, line)
+function Parser:fornum(ls, varname, line, type_annot)
 	local fs = ls.fs;
 	local base = fs.freereg;
-	self:new_localvarliteral(ls, "(for index)", 0)
-	self:new_localvarliteral(ls, "(for limit)", 1)
-	self:new_localvarliteral(ls, "(for step)", 2)
+	self:new_localvarliteral(ls, '(for index)', 0)
+	self:new_localvarliteral(ls, '(for limit)', 1)
+	self:new_localvarliteral(ls, '(for step)', 2)
 	self:new_localvar(ls, varname, 3)
-	self:checknext(ls, "=")
+	self:checknext(ls, '=')
 	self:exp1(ls)
-	self:checknext(ls, ",")
+	if type_annot then
+		local init_reg = fs.freereg - 1;
+		emit_type_check(fs, init_reg, type_annot, ls.linenumber)
+	end;
+	self:checknext(ls, ',')
 	self:exp1(ls)
-	if self:testnext(ls, ",") then
+	if self:testnext(ls, ',') then
 		self:exp1(ls)
 	else
-		Codegen:codeABx(fs, "OP_LOADK", fs.freereg, Codegen:numberK(fs, 1))
+		Codegen:codeABx(fs, 'OP_LOADK', fs.freereg, Codegen:numberK(fs, 1))
 		Codegen:reserveregs(fs, 1)
 	end;
 	self:forbody(ls, base, line, 1, true)
@@ -3522,15 +3545,20 @@ function Parser:forstat(ls, line)
 	self:enterblock(fs, bl, true)
 	Lexer:next(ls)
 	local varname = self:str_checkname(ls)
-	local c = ls.t.token;
-	if c == "=" then
-		self:fornum(ls, varname, line)
-	elseif c == "," or c == "TK_IN" then
-		self:forlist(ls, varname)
-	else
-		Lexer:syntaxerror(ls, self:LUA_QL("=") .. " or " .. self:LUA_QL("in") .. " expected")
+	local type_annot = nil;
+	if ls.t.token == ':' then
+		Lexer:next(ls)
+		type_annot = self:parse_type(ls)
 	end;
-	self:check_match(ls, "TK_END", "TK_FOR", line)
+	local c = ls.t.token;
+	if c == '=' then
+		self:fornum(ls, varname, line, type_annot)
+	elseif c == ',' or c == 'TK_IN' then
+		self:forlist(ls, varname, type_annot)
+	else
+		Lexer:syntaxerror(ls, self:LUA_QL('=') .. ' or ' .. self:LUA_QL('in') .. ' expected')
+	end;
+	self:check_match(ls, 'TK_END', 'TK_FOR', line)
 	self:leaveblock(fs)
 end;
 function Parser:test_then_block(ls)
@@ -3573,50 +3601,63 @@ function Parser:localfunc(ls)
 end;
 function Parser:ternary(ls, v)
 	self:enterlevel(ls)
+	local fs = ls.fs;
 	local line = ls.linenumber;
 	Lexer:next(ls)
 	local cond = {}
 	self:expr(ls, cond)
-	Codegen:goiftrue(ls.fs, cond)
+	Codegen:goiftrue(fs, cond)
 	self:checknext(ls, "TK_THEN")
 	local v_true = {}
 	self:subexpr(ls, v_true, 0)
-	Codegen:exp2nextreg(ls.fs, v_true)
+	Codegen:exp2nextreg(fs, v_true)
 	local result_reg = v_true.info;
-	local jump_to_else = Codegen:jump(ls.fs)
-	Codegen:patchtohere(ls.fs, cond.f)
-	local v_false = {}
-	while ls.t.token == "TK_ELSEIF" do
-		Lexer:next(ls)
+	local skip_true_jump = Codegen:jump(fs)
+	Codegen:patchtohere(fs, cond.f)
+	local jump_chain = Codegen.NO_JUMP;
+	while true do
+		if ls.t.token == "TK_ELSEIF" then
+			Lexer:next(ls)
+		elseif ls.t.token == "TK_ELSE" then
+			Lexer:lookahead(ls)
+			if ls.lookahead.token == "TK_IF" then
+				Lexer:next(ls)
+				Lexer:next(ls)
+			else
+				break
+			end
+		else
+			break
+		end;
 		local elseif_cond = {}
 		self:expr(ls, elseif_cond)
-		Codegen:goiftrue(ls.fs, elseif_cond)
+		Codegen:goiftrue(fs, elseif_cond)
 		self:checknext(ls, "TK_THEN")
 		local elseif_val = {}
 		self:subexpr(ls, elseif_val, 0)
-		Codegen:exp2nextreg(ls.fs, elseif_val)
-		local elseif_reg = elseif_val.info;
-		if elseif_reg ~= result_reg then
-			Codegen:codeABC(ls.fs, "OP_MOVE", result_reg, elseif_reg, 0)
-			Codegen:freereg(ls.fs, elseif_reg)
+		Codegen:exp2nextreg(fs, elseif_val)
+		if elseif_val.info ~= result_reg then
+			Codegen:codeABC(fs, "OP_MOVE", result_reg, elseif_val.info, 0)
+			Codegen:freereg(fs, elseif_val.info)
 		end;
-		jump_to_else = Codegen:concat(ls.fs, jump_to_else, Codegen:jump(ls.fs))
-		Codegen:patchtohere(ls.fs, elseif_cond.f)
+		jump_chain = Codegen:concat(fs, jump_chain, Codegen:jump(fs))
+		Codegen:patchtohere(fs, elseif_cond.f)
 	end;
 	self:checknext(ls, "TK_ELSE")
+	local v_false = {}
 	self:subexpr(ls, v_false, 0)
-	Codegen:exp2nextreg(ls.fs, v_false)
-	local false_reg = v_false.info;
-	if false_reg ~= result_reg then
-		Codegen:codeABC(ls.fs, "OP_MOVE", result_reg, false_reg, 0)
-		Codegen:freereg(ls.fs, false_reg)
+	Codegen:exp2nextreg(fs, v_false)
+	if v_false.info ~= result_reg then
+		Codegen:codeABC(fs, "OP_MOVE", result_reg, v_false.info, 0)
+		Codegen:freereg(fs, v_false.info)
 	end;
-	local end_jump = Codegen:jump(ls.fs)
-	Codegen:patchtohere(ls.fs, jump_to_else)
+	local final_jump = Codegen:jump(fs)
+	Codegen:patchtohere(fs, skip_true_jump)
+	Codegen:patchtohere(fs, jump_chain)
 	self:init_exp(v, "VNONRELOC", result_reg)
 	v.t = Codegen.NO_JUMP;
 	v.f = Codegen.NO_JUMP;
-	Codegen:patchtohere(ls.fs, end_jump)
+	Codegen:patchtohere(fs, final_jump)
 	self:leavelevel(ls)
 end;
 function Parser:localstat(ls)
@@ -3834,6 +3875,66 @@ function Parser:chunk(ls)
 end;
 Lexer:init()
 local LuaState;
+local function constToString(k)
+	if type(k.value) == "string" then
+		return '"' .. k.value .. '"'
+	else
+		return tostring(k.value)
+	end
+end;
+local function printFuncHeader(func, addr)
+	local nconst = func.sizek or # func.k;
+	local nloc = func.sizelocvars or # (func.locvars or {})
+	local nups = func.sizeupvalues or # (func.upvalues or {})
+	local nsubs = func.sizep or # (func.p or {})
+	local line1 = func.lineDefined or 0;
+	local line2 = func.lastlinedefined or 0;
+	local inscount = func.sizecode or # (func.code or {})
+	local size_in_bytes = inscount * 4;
+	print(string.format("main <%s:%d,%d> (%d instructions, %d bytes at %s)", func.source or "?", line1, line2, inscount, size_in_bytes, tostring(addr)))
+	print(string.format("%d%s params, %d slots, %d upvalues, %d local, %d constant, %d function", func.numparams or 0, (func.is_vararg and "+" or ""), func.maxstacksize or 0, nups, nloc, nconst, nsubs))
+end;
+local function printInstruction(pc, instr, line, k)
+	local op = opnames[instr.OP + 1 or 0] or ("<OP " .. tostring(instr.OP) .. ">")
+	local a, b, c, bx = instr.A or 0, instr.B or 0, instr.C or 0, instr.Bx;
+	local sBx = instr.sBx;
+	io.write(string.format("\t%-4d  [%d]  %-10s", pc, line or 0, op))
+	if bx ~= nil then
+		io.write(string.format("\t%d %d", a, bx))
+		if op == "LOADK" and k and k[bx] then
+			io.write("\t; ", constToString(k[bx]))
+		end
+	elseif op == "JMP" and sBx then
+		io.write(string.format("\t%d", sBx))
+	elseif op == "SETLIST" then
+		io.write(string.format("\t%d %d %d", a, b, c))
+	else
+		io.write(string.format("\t%d %d %d", a, b, c))
+		if (op == "LOADK" or op == "GETGLOBAL" or op == "SETGLOBAL") and k and b and k[b] then
+			io.write("\t; ", constToString(k[b]))
+		end
+	end;
+	io.write("\n")
+end;
+local function printProto(func, addr)
+	printFuncHeader(func, addr or tostring(func))
+	for i = 1, func.sizecode or # func.code do
+		local instr = func.code[i - 1]
+		if instr then
+			local line = func.lineinfo and func.lineinfo[i - 1] or 0;
+			printInstruction(i, instr, line, func.k)
+		end
+	end;
+	print("")
+	if func.p then
+		for i = 1, func.sizep or # func.p do
+			local sub = func.p[i - 1]
+			if sub then
+				printProto(sub, tostring(sub))
+			end
+		end
+	end
+end;
 function compile(source, name)
 	name = name or "compiled-lua"
 	local zio = Buffer:init(source)
@@ -3842,10 +3943,12 @@ function compile(source, name)
 	end;
 	local LuaState = {}
 	local func = Parser:parser(LuaState, zio, nil, "@" .. name)
+	--printProto(func)
 	local writer, buff = Serializer:make_setS()
 	local status = Serializer:dump(LuaState, func, writer, buff)
 	if status ~= 0 then
 		error("Failed to serialize bytecode")
 	end;
 	return buff.data
-end
+end;
+return compile

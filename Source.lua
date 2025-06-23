@@ -141,11 +141,11 @@ function Lexer:token2str(token)
 	return tostring(token)
 end;
 function Lexer:lexerror(ls, msg, token)
-	local tokstr = (token == "TK_NAME" or token == "TK_STRING" or token == "TK_NUMBER") and ls.buff or self:token2str(token) or "<unknown>"
-	local context = ls.buff or ls.current or "<unknown>"
-	local line = ls.linenumber;
-	error(("%s:%d: %s (near '%s')%s"):format(self:chunkid(ls.source, self.MAXSRC), line, msg, context, token and (", token: " .. tokstr) or ""))
-end;
+    local tokstr = (token == "TK_NAME" or token == "TK_STRING" or token == "TK_NUMBER") and ls.buff or self:token2str(token) or "<unknown>"
+    local context = ls.buff or ls.current or "<unknown>"
+    local line = ls.linenumber;
+    error(("%s:%d: %s (near '%s')%s, full buffer: '%s'"):format(self:chunkid(ls.source, self.MAXSRC), line, msg, context, token and (", token: " .. tokstr) or "", ls.buff or "nil"))
+end
 function Lexer:syntaxerror(ls, msg)
 	self:lexerror(ls, msg, ls.t.token)
 end;
@@ -213,63 +213,48 @@ end;
 function Lexer:buffreplace(ls, from, to)
 	ls.buff = ls.buff:gsub(from, to)
 end;
-function Lexer:trydecpoint(ls, Token)
-	self:buffreplace(ls, ls.decpoint, ".")
-	self:buffreplace(ls, "_", "")
-	local s = ls.buff;
-	local num = tonumber(s)
-	if not num then
-		self:lexerror(ls, "malformed number", "TK_NUMBER")
-	end;
-	Token.seminfo = num
-end;
 function Lexer:read_numeral(ls, Token)
 	local buffer = {}
+	if ls.buff == "." then
+		buffer[#buffer + 1] = "."
+		ls.buff = ""
+	end
+	local is_hex, is_bin, is_oct = false, false, false;
 	local neg = false;
 	if ls.current == "-" then
 		neg = true;
 		self:nextc(ls)
 	end;
-	local is_hex, is_bin, is_oct = false, false, false;
-	local is_dec, is_rat, is_nat, is_basez, is_base62 = false, false, false, false, false;
 	if ls.current == "0" then
 		buffer[# buffer + 1] = ls.current;
 		self:nextc(ls)
 		local c = ls.current:lower()
 		if c == "x" then
-			is_hex = true
+			is_hex = true;
+			buffer[# buffer + 1] = c;
+			self:nextc(ls)
 		elseif c == "b" then
-			is_bin = true
+			is_bin = true;
+			buffer[# buffer + 1] = c;
+			self:nextc(ls)
 		elseif c == "o" then
-			is_oct = true
-		elseif c == "d" then
-			is_dec = true
-		elseif c == "r" then
-			is_rat = true
-		elseif c == "n" then
-			is_nat = true
-		elseif c == "z" then
-			is_basez = true
-		elseif c == "s" then
-			is_base62 = true
-		end;
-		if is_hex or is_bin or is_oct or is_dec or is_rat or is_nat or is_basez or is_base62 then
+			is_oct = true;
 			buffer[# buffer + 1] = c;
 			self:nextc(ls)
 		end
 	end;
-	local pat = is_hex and "[0-9a-fA-F_]" or is_bin and "[01_]" or is_oct and "[0-7_]" or is_basez and "[0-9a-zA-Z_]" or is_base62 and "[0-9a-zA-Z_]" or "[0-9_/.]"
+	local pat = is_hex and "[0-9a-fA-F_]" or is_bin and "[01_]" or is_oct and "[0-7_]" or "[0-9_]"
 	local seen_dot, seen_exp = false, false;
 	while true do
 		local ch = ls.current;
 		if ch:match(pat) then
 			buffer[# buffer + 1] = ch;
 			self:nextc(ls)
-		elseif ch == "." and not (seen_dot or is_bin or is_oct or is_rat or is_basez or is_base62) then
+		elseif ch == "." and not (seen_dot or is_bin or is_oct) then
 			seen_dot = true;
 			buffer[# buffer + 1] = ch;
 			self:nextc(ls)
-		elseif (ch == "e" or ch == "E") and not seen_exp and not (is_hex or is_bin or is_oct or is_basez or is_base62 or is_rat or is_nat) then
+		elseif (ch == "e" or ch == "E") and not seen_exp and not (is_hex or is_bin or is_oct) then
 			seen_exp = true;
 			buffer[# buffer + 1] = ch;
 			self:nextc(ls)
@@ -301,7 +286,7 @@ function Lexer:read_numeral(ls, Token)
 		for d in intp:gmatch(".") do
 			v = v * 16 + tonumber(d, 16)
 		end;
-		if # fracp > 0 then
+		if fracp and # fracp > 0 then
 			local div = 16;
 			for d in fracp:gmatch(".") do
 				v = v + tonumber(d, 16) / div;
@@ -314,37 +299,6 @@ function Lexer:read_numeral(ls, Token)
 		num = tonumber(s:match("^0[bB]([01]+)$") or s, 2)
 	elseif is_oct then
 		num = tonumber(s:match("^0[oO]([0-7]+)$") or s, 8)
-	elseif is_dec then
-		num = tonumber(s:match("^0[dD](.+)$"))
-	elseif is_basez then
-		num = tonumber(s:match("^0[zZ]([0-9a-zA-Z]+)$"), 36)
-	elseif is_base62 then
-		local digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-		local value = 0;
-		local str = s:match("^0[sS]([0-9A-Za-z]+)$")
-		if not str then
-			self:lexerror(ls, "malformed base62", "TK_NUMBER")
-		end;
-		for i = 1, # str do
-			local c = str:sub(i, i)
-			local idx = digits:find(c, 1, true)
-			if not idx then
-				self:lexerror(ls, "invalid base62 digit: " .. c, "TK_NUMBER")
-			end;
-			value = value * 62 + (idx - 1)
-		end;
-		num = value
-	elseif is_rat then
-		local a, b = s:match("^0[rR](%d+)%/(%d+)$")
-		if not a or not b then
-			self:lexerror(ls, "malformed rational (expected 0rA/B)", "TK_NUMBER")
-		end;
-		num = tonumber(a) / tonumber(b)
-	elseif is_nat then
-		num = tonumber(s:match("^0[nN](%d+)$"))
-		if not num or num < 0 or s:find("%.") then
-			self:lexerror(ls, "malformed natural (expected non-negative integer)", "TK_NUMBER")
-		end
 	else
 		self:buffreplace(ls, ls.decpoint, ".")
 		num = tonumber(s)
@@ -352,10 +306,7 @@ function Lexer:read_numeral(ls, Token)
 	if not num then
 		self:lexerror(ls, "malformed number", "TK_NUMBER")
 	end;
-	Token.seminfo = neg and (type(num) == "number" and - num or {
-		real = - num.real,
-		imag = - num.imag
-	}) or num
+	Token.seminfo = neg and - num or num
 end;
 function Lexer:read_long_string(ls, Token, sep)
 	local cont = 0;
@@ -1951,8 +1902,6 @@ function Parser:checklimit(fs, v, l, m)
 		self:errorlimit(fs, l, m)
 	end
 end;
-function Parser:anchor_token(ls)
-end;
 function Parser:error_expected(ls, token)
 	Lexer:syntaxerror(ls, "'" .. Lexer:token2str(ls, token) .. "' expected")
 end;
@@ -2792,19 +2741,6 @@ function Parser:funcargs(ls, f)
 	Codegen:fixline(fs, line)
 	fs.freereg = base + 1
 end;
-function Parser:prefixexp(ls, v)
-	if ls.t.token == "(" then
-		local line = ls.linenumber;
-		Lexer:next(ls)
-		self:expr(ls, v)
-		self:check_match(ls, ")", "(", line)
-		Codegen:dischargevars(ls.fs, v)
-	elseif ls.t.token == "TK_NAME" then
-		self:singlevar(ls, v)
-	else
-		Lexer:syntaxerror(ls, "unexpected symbol")
-	end
-end;
 function Parser:primaryexp(ls, v)
 	local fs = ls.fs;
 	local c = ls.t.token;
@@ -2922,7 +2858,7 @@ function Parser:addpendinggoto(fs, label, pc, line)
 	}
 	fs.npendinggotos = fs.npendinggotos + 1
 end;
-function Parser:parse_arrow_paramlist(ls)
+--[[function Parser:parse_arrow_paramlist(ls)
 	if ls.t.token ~= '(' then
 		return nil
 	end;
@@ -2968,7 +2904,7 @@ function Parser:parse_arrow_paramlist(ls)
 	else
 		return nil
 	end
-end;
+end;]]
 function Parser:simpleexp(ls, v)
 	local handlers = {
 		TK_NUMBER = function()

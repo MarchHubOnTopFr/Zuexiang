@@ -71,7 +71,6 @@ Lexer.RESERVED = [[
     TK_FOR for
     TK_FUNCTION function
     TK_GOTO goto
-    TK_AS as
     TK_IF if
     TK_IN in
     TK_LOCAL local

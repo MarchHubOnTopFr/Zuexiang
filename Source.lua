@@ -1,3 +1,35 @@
+--[[
+  Zuexiang (祖翔)
+  A fork of the Yueliang Lua 5.1 compiler, with extended features and optimizations.
+
+  Original base project:
+    Yueliang - Lua 5.1 Bytecode Compiler
+    Author: Kein-Hong Man
+    Source: http://yueliang.luaforge.net/
+
+  Modifications and extensions by:
+    Nyreel
+
+  This version includes:
+    - Support for 'goto' and 'continue'
+    - Compound assignment (+=, -=, etc.) with proper table/index handling
+    - '!=' alias for '~='
+    - Luau-style number literals (binary, octal, hex, 1_000, 1e3, etc.)
+    - Ternary expressions in local declarations
+    - Integer division operator (//)
+    - Type annotation, type assertion, and type definitions (parser-only)
+    - Parsing support for <const> and <close> variable qualifiers
+    - Renamed local names for better readability
+    - Parser and performance improvements
+
+  License:
+    MIT License (same as original Yueliang)
+
+  Note:
+    This is not an official continuation of Yueliang. It’s a personal project made
+    for experimentation, learning, and fun. Expect messy code and fast hacks.
+]]
+
 local Buffer, Parser, Lexer, Serializer, Codegen = {}, {}, {}, {}, {}
 local typed = false;
 local floor, abs, log, char, byte, format, insert, concat, min = math.floor, math.abs, math.log, string.char, string.byte, string.format, table.insert, table.concat, math.min;

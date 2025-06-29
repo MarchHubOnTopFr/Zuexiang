@@ -22,11 +22,6 @@ function Buffer:init(source)
 		p = 0
 	}
 end;
-function Buffer:fill(z)
-	z.data = z.reader() or ""
-	z.n, z.p = # z.data - 1, 1;
-	return z.n >= 0 and z.data:sub(1, 1) or "EOZ"
-end;
 Lexer.RESERVED = [[
     TK_AND and
     TK_BREAK break
@@ -821,29 +816,6 @@ function Serializer:make_setS()
 		end;
 		insert(buff.chunks, s)
 		return 0
-	end;
-	return writer, buff
-end;
-function Serializer:make_setF(filename)
-	local buff = {}
-	buff.h = io.open(filename, "wb")
-	if not buff.h then
-		return nil
-	end;
-	local writer = function(s, buff)
-		if not buff.h then
-			return 0
-		end;
-		if not s then
-			if buff.h:close() then
-				return 0
-			end
-		else
-			if buff.h:write(s) then
-				return 0
-			end
-		end;
-		return 1
 	end;
 	return writer, buff
 end;
@@ -2512,8 +2484,10 @@ function Parser:lastlistfield(fs, cc)
 		Codegen:setmultret(fs, cc.v)
 		Codegen:setlist(fs, cc.t.info, cc.na, self.LUA_MULTRET)
 		cc.na = cc.na - 1
-	elseif cc.v.k ~= "VVOID" then
-		Codegen:exp2nextreg(fs, cc.v)
+	else
+		if cc.v.k ~= "VVOID" then
+			Codegen:exp2nextreg(fs, cc.v)
+		end;
 		Codegen:setlist(fs, cc.t.info, cc.na, cc.tostore)
 	end
 end;
@@ -3894,20 +3868,6 @@ local function printProto(func, addr)
 			if sub then
 				printProto(sub, tostring(sub))
 			end
-		end
-	end
-end;
-function printTable(tbl, indent)
-	indent = indent or 0;
-	local prefix = string.rep("  ", indent)
-	for k, v in pairs(tbl) do
-		local keyStr = tostring(k)
-		if type(v) == "table" then
-			print(prefix .. keyStr .. " = {")
-			printTable(v, indent + 1)
-			print(prefix .. "}")
-		else
-			print(prefix .. keyStr .. " = " .. tostring(v))
 		end
 	end
 end;
